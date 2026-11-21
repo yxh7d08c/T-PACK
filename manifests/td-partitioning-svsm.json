@@ -1,0 +1,6 @@
+{
+  "commit": "b8042f5bee61ad8323f8f50d601817c3a56ea19e",
+  "remotes": "origin\thttps://github.com/intel-staging/td-partitioning-svsm.git (fetch)\norigin\thttps://github.com/intel-staging/td-partitioning-svsm.git (push)",
+  "status": "M kernel/src/fw_cfg.rs\n M kernel/src/lib.rs\n M kernel/src/svsm.rs\n M kernel/src/tdx/gctx.rs\n M kernel/src/tdx/gmem.rs\n M kernel/src/tdx/instr_emul.rs\n M kernel/src/tdx/interrupts.rs\n M kernel/src/tdx/ioreq.rs\n M kernel/src/tdx/mod.rs\n M kernel/src/tdx/msr_bitmap.rs\n M kernel/src/tdx/opcode.rs\n M kernel/src/tdx/percpu.rs\n M kernel/src/tdx/sirte.rs\n M kernel/src/tdx/tdcall/asm/tdvmcall.asm\n M kernel/src/tdx/tdcall/mod.rs\n M kernel/src/tdx/tdcall/tdx_tdcall.rs\n M kernel/src/tdx/tdp.rs\n M kernel/src/tdx/utils.rs\n M kernel/src/tdx/vcpu.rs\n M kernel/src/tdx/vcpu_comm.rs\n M kernel/src/tdx/vcpuid.rs\n M kernel/src/tdx/vcr.rs\n M kernel/src/tdx/virq.rs\n M kernel/src/tdx/vlapic.rs\n M kernel/src/tdx/vmcs_lib.rs\n M kernel/src/tdx/vmexit.rs\n M kernel/src/tdx/vmsr.rs\n?? kernel/src/quote.rs\n?? kernel/src/tdx/vmexit_patch.rs",
+  "submodules": ""
+}

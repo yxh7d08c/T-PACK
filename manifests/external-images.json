@@ -1,0 +1,47 @@
+[
+  {
+    "path": "CentOS-Stream-GenericCloud-9-latest-2.x86_64.qcow2",
+    "original_bytes": 1925578752,
+    "included_bytes": 0
+  },
+  {
+    "path": "CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2",
+    "original_bytes": 1925513216,
+    "included_bytes": 0
+  },
+  {
+    "path": "hyc3-l2-1-rootfs.qcow2",
+    "original_bytes": 2634416128,
+    "included_bytes": 0
+  },
+  {
+    "path": "hyc3-l2-1.qcow2",
+    "original_bytes": 28049408,
+    "included_bytes": 0
+  },
+  {
+    "path": "hyc3-l2-2-rootfs.qcow2",
+    "original_bytes": 2634416128,
+    "included_bytes": 0
+  },
+  {
+    "path": "hyc3-l2-2.qcow2",
+    "original_bytes": 28049408,
+    "included_bytes": 0
+  },
+  {
+    "path": "initramfs-5.14.0-710.el9.x86_64.img",
+    "original_bytes": 260878336,
+    "included_bytes": 0
+  },
+  {
+    "path": "initramfs-hyc3-debug.img",
+    "original_bytes": 236615528,
+    "included_bytes": 0
+  },
+  {
+    "path": "test.img",
+    "original_bytes": 236614504,
+    "included_bytes": 0
+  }
+]

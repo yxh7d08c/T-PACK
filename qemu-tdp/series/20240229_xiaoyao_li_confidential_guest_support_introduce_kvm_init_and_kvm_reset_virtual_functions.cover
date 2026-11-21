@@ -1,0 +1,79 @@
+Subject: [PATCH 0/4] Confidential Guest Support: Introduce kvm_init() and
+ kvm_reset() virtual functions
+From: Xiaoyao Li <xiaoyao.li@intel.com>
+Date: Thu, 29 Feb 2024 01:00:34 -0500
+Message-Id: <20240229060038.606591-1-xiaoyao.li@intel.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+This series was inspired and suggested by Daniel:
+https://lore.kernel.org/qemu-devel/ZbfoQsEuv6_zwl3b@redhat.com/
+
+I remove the rfc tag in this version, to get more attention.
+
+Currently, different confidential VMs in different architectures have
+their own specific *_kvm_init() (and some have *_kvm_reset()) exposed
+for KVM stuff when it's a confidential VM. e.g., sev_kmv_init() for x86
+SEV, pef_kvm_init() and pef_kvm_reset() for PPC PEF, and s390_pv_init()
+for s390 PV VMs.
+
+Introduce a generic .kvm_init() and .kvm_reset() functions in
+ConfidentialGuestSupportClass, so that different cgs technologies in
+different architectures can implement their own, while common interface
+of cgs can be used.
+
+This series implements two helper functions confidential_guest_kvm_init()
+and confidential_guest_kvm_reset() in Patch 1. In the following patches,
+they are used in each arch to replace specific exposed functions.
+X86 will benefit more from the new generic interface  when TDX support is
+added later.
+
+There is one step forward possible, that calling
+confidential_guest_kvm_init() before kvm_arch_init() in kvm_int() in
+accel/kvm/kvm-all.c. This way, each arch doesn't need to call their
+specific code in arch-specific code.
+	
+X86 fits it, however I'm not sure if ppc and s390 fit it as well.
+Because currently, both ppc and s390 calls it in MachineClass->init().
+I'm not sure if there is any order dependency and need input from
+corresponding arch folks.
+
+
+===
+changes from RFC v1:
+- remove RFC tag;
+- move the !NULL check of ms->cgs into callers;
+- delete whole sev-stub.c;
+
+RFC v1:
+https://lore.kernel.org/qemu-devel/20240206082852.3333299-1-xiaoyao.li@intel.com/
+
+Xiaoyao Li (4):
+  confidential guest support: Add kvm_init() and kvm_reset() in class
+  i386/sev: Switch to use confidential_guest_kvm_init()
+  ppc/pef: switch to use confidential_guest_kvm_init/reset()
+  s390: Switch to use confidential_guest_kvm_init()
+
+ hw/ppc/pef.c                              |   9 +-
+ hw/ppc/spapr.c                            |  10 +-
+ hw/s390x/s390-virtio-ccw.c                |   5 +-
+ include/exec/confidential-guest-support.h |  34 +++++-
+ include/hw/ppc/pef.h                      |  17 ---
+ target/i386/kvm/kvm.c                     |  10 +-
+ target/i386/kvm/meson.build               |   2 -
+ target/i386/kvm/sev-stub.c                |  21 ----
+ target/i386/sev.c                         | 120 +++++++++++-----------
+ target/i386/sev.h                         |   2 -
+ target/s390x/kvm/pv.c                     |   8 ++
+ target/s390x/kvm/pv.h                     |  14 ---
+ 12 files changed, 126 insertions(+), 126 deletions(-)
+ delete mode 100644 include/hw/ppc/pef.h
+ delete mode 100644 target/i386/kvm/sev-stub.c
+
+-- 
+2.34.1
+
+
+
+

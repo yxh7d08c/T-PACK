@@ -1,0 +1,2 @@
+This initramfs proves L1/SVSM + L2-1 + L2-2 bring-up and shared-memory handoff.
+Use HYC3_ROOTFS=virtio ./run_qemu.sh to debug the qcow2 rootfs path.

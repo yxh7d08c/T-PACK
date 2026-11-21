@@ -1,0 +1,2226 @@
+diff --git a/accel/kvm/kvm-all.c b/accel/kvm/kvm-all.c
+index 2c83b6d270..5b519f6b05 100644
+--- a/accel/kvm/kvm-all.c
++++ b/accel/kvm/kvm-all.c
+@@ -24,6 +24,7 @@
+ #include "qemu/config-file.h"
+ #include "qemu/error-report.h"
+ #include "qapi/error.h"
++#include "hw/pci/pci.h"
+ #include "hw/pci/msi.h"
+ #include "hw/pci/msix.h"
+ #include "hw/s390x/adapter.h"
+@@ -48,6 +49,9 @@
+ #include "kvm-cpus.h"
+ #include "sysemu/dirtylimit.h"
+ #include "qemu/range.h"
++#ifdef TARGET_I386
++#include "kvm/tdx.h"
++#endif
+ 
+ #include "hw/boards.h"
+ #include "sysemu/stats.h"
+@@ -95,6 +99,90 @@ static bool kvm_guest_memfd_supported;
+ static uint64_t kvm_supported_memory_attributes;
+ static hwaddr kvm_max_slot_size = ~0;
+ 
++static bool hyc3_qemu_debug_enabled(void)
++{
++    const char *debug = getenv("HYC3_QEMU_DEBUG");
++
++    return debug && debug[0] && strcmp(debug, "0") != 0;
++}
++
++static bool hyc3_msi_devid_required_for_dev(PCIDevice *dev)
++{
++    if (!pci_available || !dev) {
++        return false;
++    }
++
++    if (kvm_msi_devid_required()) {
++        return true;
++    }
++
++#ifdef TARGET_I386
++    /*
++     * HYC3 TDX/SVSM routes virtio irqfd MSI completions by requester ID.
++     * Plain x86 KVM often leaves kvm_msi_use_devid false, but without the
++     * devid both L2 virtio devices collapse onto the default SIRTE path and
++     * VM2's block completion ring stays empty.
++     */
++    if (is_tdx_vm()) {
++        return true;
++    }
++#endif
++
++    return false;
++}
++
++#define HYC3_MSI_ADDR_DEST_ID_MASK  0x000ff000ULL
++#define HYC3_MSI_ADDR_DEST_ID_SHIFT 12
++#define HYC3_L2_1_MSI_DEST_ID       1ULL
++/*
++ * Keep this as a real single-target xAPIC logical destination.  Dest 2 can be
++ * used by L2-1's second logical CPU, while 0xfe fans out to multiple HYC3 VPs
++ * and causes empty SIRTE drains.  Dest 4 maps to the L2-2 BSP/APIC2 logical bit;
++ * the SVSM rewrites it back to guest-local dest 1 before injecting into L2-2.
++ */
++#define HYC3_L2_2_MSI_DEST_ID       4ULL
++
++static bool hyc3_tdx_l2_1_requester_id(uint32_t requester_id)
++{
++#ifdef TARGET_I386
++    uint8_t bus = requester_id >> 8;
++    uint8_t devfn = requester_id & 0xff;
++    uint8_t slot = PCI_SLOT(devfn);
++
++    return is_tdx_vm() && bus == 0 && (slot == 3 || slot == 5);
++#else
++    return false;
++#endif
++}
++
++static bool hyc3_tdx_l2_2_requester_id(uint32_t requester_id)
++{
++#ifdef TARGET_I386
++    uint8_t bus = requester_id >> 8;
++    uint8_t devfn = requester_id & 0xff;
++    uint8_t slot = PCI_SLOT(devfn);
++
++    return is_tdx_vm() && bus == 0 && (slot == 4 || slot == 6);
++#else
++    return false;
++#endif
++}
++
++static MSIMessage hyc3_encode_tdx_l2_msi_msg(MSIMessage msg, bool valid_devid,
++                                             uint32_t devid)
++{
++#ifdef TARGET_I386
++    if (valid_devid && hyc3_tdx_l2_1_requester_id(devid)) {
++        msg.address &= ~HYC3_MSI_ADDR_DEST_ID_MASK;
++        msg.address |= HYC3_L2_1_MSI_DEST_ID << HYC3_MSI_ADDR_DEST_ID_SHIFT;
++    } else if (valid_devid && hyc3_tdx_l2_2_requester_id(devid)) {
++        msg.address &= ~HYC3_MSI_ADDR_DEST_ID_MASK;
++        msg.address |= HYC3_L2_2_MSI_DEST_ID << HYC3_MSI_ADDR_DEST_ID_SHIFT;
++    }
++#endif
++    return msg;
++}
++
+ static const KVMCapabilityInfo kvm_required_capabilites[] = {
+     KVM_CAP_INFO(USER_MEMORY),
+     KVM_CAP_INFO(DESTROY_MEMORY_REGION_WORKS),
+@@ -2057,19 +2145,31 @@ static int kvm_irqchip_get_virq(KVMState *s)
+     }
+ }
+ 
+-int kvm_irqchip_send_msi(KVMState *s, MSIMessage msg)
++static int kvm_irqchip_send_msi_common(KVMState *s, MSIMessage msg,
++                                        bool valid_devid, uint32_t devid)
+ {
+     struct kvm_msi msi;
+ 
++    msg = hyc3_encode_tdx_l2_msi_msg(msg, valid_devid, devid);
+     msi.address_lo = (uint32_t)msg.address;
+     msi.address_hi = msg.address >> 32;
+     msi.data = le32_to_cpu(msg.data);
+-    msi.flags = 0;
++    msi.flags = valid_devid ? KVM_MSI_VALID_DEVID : 0;
++    msi.devid = valid_devid ? devid : 0;
+     memset(msi.pad, 0, sizeof(msi.pad));
+ 
+     return kvm_vm_ioctl(s, KVM_SIGNAL_MSI, &msi);
+ }
+ 
++int kvm_irqchip_send_msi(KVMState *s, MSIMessage msg)
++{
++    return kvm_irqchip_send_msi_common(s, msg, false, 0);
++}
++
++int kvm_irqchip_send_msi_with_devid(KVMState *s, MSIMessage msg, uint32_t devid)
++{
++    return kvm_irqchip_send_msi_common(s, msg, true, devid);
++}
+ int kvm_irqchip_add_msi_route(KVMRouteChange *c, int vector, PCIDevice *dev)
+ {
+     struct kvm_irq_routing_entry kroute = {};
+@@ -2079,6 +2179,9 @@ int kvm_irqchip_add_msi_route(KVMRouteChange *c, int vector, PCIDevice *dev)
+ 
+     if (pci_available && dev) {
+         msg = pci_get_msi_message(dev, vector);
++        if (hyc3_msi_devid_required_for_dev(dev)) {
++            msg = hyc3_encode_tdx_l2_msi_msg(msg, true, pci_requester_id(dev));
++        }
+     }
+ 
+     if (kvm_gsi_direct_mapping()) {
+@@ -2100,10 +2203,20 @@ int kvm_irqchip_add_msi_route(KVMRouteChange *c, int vector, PCIDevice *dev)
+     kroute.u.msi.address_lo = (uint32_t)msg.address;
+     kroute.u.msi.address_hi = msg.address >> 32;
+     kroute.u.msi.data = le32_to_cpu(msg.data);
+-    if (pci_available && kvm_msi_devid_required()) {
++    if (hyc3_msi_devid_required_for_dev(dev)) {
+         kroute.flags = KVM_MSI_VALID_DEVID;
+         kroute.u.msi.devid = pci_requester_id(dev);
+     }
++    if (hyc3_qemu_debug_enabled()) {
++        fprintf(stderr,
++                "HYC3-KVM-MSI-ROUTE add dev=%s vector=%d virq=%d addr=0x%llx data=0x%x valid_devid=%d devid=0x%x l2_1=%d l2_2=%d\n",
++                dev ? dev->name : "N/A", vector, virq,
++                (unsigned long long)msg.address, le32_to_cpu(msg.data),
++                !!(kroute.flags & KVM_MSI_VALID_DEVID),
++                (kroute.flags & KVM_MSI_VALID_DEVID) ? kroute.u.msi.devid : 0,
++                (kroute.flags & KVM_MSI_VALID_DEVID) ? hyc3_tdx_l2_1_requester_id(kroute.u.msi.devid) : 0,
++                (kroute.flags & KVM_MSI_VALID_DEVID) ? hyc3_tdx_l2_2_requester_id(kroute.u.msi.devid) : 0);
++    }
+     if (kvm_arch_fixup_msi_route(&kroute, msg.address, msg.data, dev)) {
+         kvm_irqchip_release_virq(s, virq);
+         return -EINVAL;
+@@ -2124,6 +2237,10 @@ int kvm_irqchip_update_msi_route(KVMState *s, int virq, MSIMessage msg,
+ {
+     struct kvm_irq_routing_entry kroute = {};
+ 
++    if (hyc3_msi_devid_required_for_dev(dev)) {
++        msg = hyc3_encode_tdx_l2_msi_msg(msg, true, pci_requester_id(dev));
++    }
++
+     if (kvm_gsi_direct_mapping()) {
+         return 0;
+     }
+@@ -2138,10 +2255,20 @@ int kvm_irqchip_update_msi_route(KVMState *s, int virq, MSIMessage msg,
+     kroute.u.msi.address_lo = (uint32_t)msg.address;
+     kroute.u.msi.address_hi = msg.address >> 32;
+     kroute.u.msi.data = le32_to_cpu(msg.data);
+-    if (pci_available && kvm_msi_devid_required()) {
++    if (hyc3_msi_devid_required_for_dev(dev)) {
+         kroute.flags = KVM_MSI_VALID_DEVID;
+         kroute.u.msi.devid = pci_requester_id(dev);
+     }
++    if (hyc3_qemu_debug_enabled()) {
++        fprintf(stderr,
++                "HYC3-KVM-MSI-ROUTE update dev=%s virq=%d addr=0x%llx data=0x%x valid_devid=%d devid=0x%x l2_1=%d l2_2=%d\n",
++                dev ? dev->name : "N/A", virq,
++                (unsigned long long)msg.address, le32_to_cpu(msg.data),
++                !!(kroute.flags & KVM_MSI_VALID_DEVID),
++                (kroute.flags & KVM_MSI_VALID_DEVID) ? kroute.u.msi.devid : 0,
++                (kroute.flags & KVM_MSI_VALID_DEVID) ? hyc3_tdx_l2_1_requester_id(kroute.u.msi.devid) : 0,
++                (kroute.flags & KVM_MSI_VALID_DEVID) ? hyc3_tdx_l2_2_requester_id(kroute.u.msi.devid) : 0);
++    }
+     if (kvm_arch_fixup_msi_route(&kroute, msg.address, msg.data, dev)) {
+         return -EINVAL;
+     }
+@@ -2268,6 +2395,10 @@ int kvm_irqchip_send_msi(KVMState *s, MSIMessage msg)
+     abort();
+ }
+ 
++int kvm_irqchip_send_msi_with_devid(KVMState *s, MSIMessage msg, uint32_t devid)
++{
++    abort();
++}
+ int kvm_irqchip_add_msi_route(KVMRouteChange *c, int vector, PCIDevice *dev)
+ {
+     return -ENOSYS;
+diff --git a/hw/acpi/cpu.c b/hw/acpi/cpu.c
+index 2d81c1e790..c7c5995031 100644
+--- a/hw/acpi/cpu.c
++++ b/hw/acpi/cpu.c
+@@ -353,8 +353,13 @@ void build_cpus_aml(Aml *table, MachineState *machine, CPUHotplugFeatures opts,
+     Aml *sb_scope = aml_scope("_SB");
+     MachineClass *mc = MACHINE_GET_CLASS(machine);
+     const CPUArchIdList *arch_ids = mc->possible_cpu_arch_ids(machine);
++    uint32_t arch_count = arch_ids->len;
+     char *cphp_res_path = g_strdup_printf("%s." CPUHP_RES_DEVICE, res_root);
+ 
++    if (opts.cpu_count_limit && opts.cpu_count_limit < arch_count) {
++        arch_count = opts.cpu_count_limit;
++    }
++
+     cpu_ctrl_dev = aml_device("%s", cphp_res_path);
+     {
+         Aml *crs;
+@@ -429,7 +434,7 @@ void build_cpus_aml(Aml *table, MachineState *machine, CPUHotplugFeatures opts,
+         aml_append(cpus_dev, aml_name_decl("_CID", aml_eisaid("PNP0A05")));
+ 
+         method = aml_method(CPU_NOTIFY_METHOD, 2, AML_NOTSERIALIZED);
+-        for (i = 0; i < arch_ids->len; i++) {
++        for (i = 0; i < arch_count; i++) {
+             Aml *cpu = aml_name(CPU_NAME_FMT, i);
+             Aml *uid = aml_arg(0);
+             Aml *event = aml_arg(1);
+@@ -525,7 +530,7 @@ void build_cpus_aml(Aml *table, MachineState *machine, CPUHotplugFeatures opts,
+                  * CPU_ADDED_LIST capacity is exhausted
+                  */
+                 while_ctx = aml_while(aml_land(aml_equal(has_event, one),
+-                                      aml_lless(uid, aml_int(arch_ids->len))));
++                                      aml_lless(uid, aml_int(arch_count))));
+                 {
+                      /*
+                       * clear loop exit condition, ins_evt/rm_evt checks will
+@@ -644,7 +649,7 @@ void build_cpus_aml(Aml *table, MachineState *machine, CPUHotplugFeatures opts,
+         aml_append(cpus_dev, method);
+ 
+         /* build Processor object for each processor */
+-        for (i = 0; i < arch_ids->len; i++) {
++        for (i = 0; i < arch_count; i++) {
+             Aml *dev;
+             Aml *uid = aml_int(i);
+             GArray *madt_buf = g_array_new(0, 1, 1);
+diff --git a/hw/block/virtio-blk.c b/hw/block/virtio-blk.c
+index 738cb2ac36..c14a74d3f3 100644
+--- a/hw/block/virtio-blk.c
++++ b/hw/block/virtio-blk.c
+@@ -34,6 +34,15 @@
+ #include "hw/virtio/virtio-bus.h"
+ #include "migration/qemu-file-types.h"
+ #include "hw/virtio/virtio-access.h"
++
++extern bool is_tdx_vm(void);
++
++static bool hyc3_qemu_debug_enabled(void)
++{
++    const char *debug = getenv("HYC3_QEMU_DEBUG");
++
++    return debug && debug[0] && strcmp(debug, "0") != 0;
++}
+ #include "hw/virtio/virtio-blk-common.h"
+ #include "qemu/coroutine.h"
+ 
+@@ -66,9 +75,17 @@ static void virtio_blk_req_complete(VirtIOBlockReq *req, unsigned char status)
+     iov_discard_undo(&req->inhdr_undo);
+     iov_discard_undo(&req->outhdr_undo);
+     virtqueue_push(req->vq, &req->elem, req->in_len);
+-    if (qemu_in_iothread()) {
++    if (qemu_in_iothread() && !is_tdx_vm()) {
+         virtio_notify_irqfd(vdev, req->vq);
+     } else {
++        static unsigned int hyc3_tdx_complete_logs;
++
++        if (is_tdx_vm() && hyc3_qemu_debug_enabled() && hyc3_tdx_complete_logs++ < 512) {
++            const char *id = vdev->parent_obj.id ? vdev->parent_obj.id : "-";
++            fprintf(stderr,
++                    "HYC3-VIRTIO-BLK: complete vdev=%s id=%s status=0x%x\n",
++                    vdev->name ? vdev->name : "-", id, status);
++        }
+         virtio_notify(vdev, req->vq);
+     }
+ }
+@@ -1121,6 +1138,17 @@ void virtio_blk_handle_vq(VirtIOBlock *s, VirtQueue *vq)
+         }
+ 
+         while ((req = virtio_blk_get_request(s, vq))) {
++            if (is_tdx_vm() && hyc3_qemu_debug_enabled()) {
++                static unsigned int hyc3_tdx_req_logs;
++
++                if (hyc3_tdx_req_logs++ < 512) {
++                    VirtIODevice *vdev = VIRTIO_DEVICE(s);
++                    const char *id = vdev->parent_obj.id ? vdev->parent_obj.id : "-";
++                    fprintf(stderr,
++                            "HYC3-VIRTIO-BLK: request vdev=%s id=%s\n",
++                            vdev->name ? vdev->name : "-", id);
++                }
++            }
+             if (virtio_blk_handle_request(req, &mrb)) {
+                 virtqueue_detach_element(req->vq, &req->elem, 0);
+                 virtio_blk_free_request(req);
+@@ -1144,6 +1172,19 @@ static void virtio_blk_handle_output(VirtIODevice *vdev, VirtQueue *vq)
+ {
+     VirtIOBlock *s = (VirtIOBlock *)vdev;
+ 
++    if (is_tdx_vm()) {
++        static unsigned int hyc3_tdx_output_logs;
++
++        if (hyc3_qemu_debug_enabled() && hyc3_tdx_output_logs++ < 512) {
++            const char *id = vdev->parent_obj.id ? vdev->parent_obj.id : "-";
++            fprintf(stderr,
++                    "HYC3-VIRTIO-BLK: handle_output vdev=%s id=%s force ioeventfd off disabled=%d started=%d\n",
++                    vdev->name ? vdev->name : "-", id, s->ioeventfd_disabled,
++                    s->ioeventfd_started);
++        }
++        s->ioeventfd_disabled = true;
++    }
++
+     if (!s->ioeventfd_disabled && !s->ioeventfd_started) {
+         /* Some guests kick before setting VIRTIO_CONFIG_S_DRIVER_OK so start
+          * ioeventfd here instead of waiting for .set_status().
+diff --git a/hw/core/machine.c b/hw/core/machine.c
+index 651a3d463a..38ccf3b9f0 100644
+--- a/hw/core/machine.c
++++ b/hw/core/machine.c
+@@ -337,6 +337,51 @@ static void machine_set_append(Object *obj, const char *value, Error **errp)
+     ms->kernel_cmdline = g_strdup(value);
+ }
+ 
++static char *machine_get_kernel2(Object *obj, Error **errp)
++{
++    MachineState *ms = MACHINE(obj);
++
++    return g_strdup(ms->kernel2_filename);
++}
++
++static void machine_set_kernel2(Object *obj, const char *value, Error **errp)
++{
++    MachineState *ms = MACHINE(obj);
++
++    g_free(ms->kernel2_filename);
++    ms->kernel2_filename = g_strdup(value);
++}
++
++static char *machine_get_initrd2(Object *obj, Error **errp)
++{
++    MachineState *ms = MACHINE(obj);
++
++    return g_strdup(ms->initrd2_filename);
++}
++
++static void machine_set_initrd2(Object *obj, const char *value, Error **errp)
++{
++    MachineState *ms = MACHINE(obj);
++
++    g_free(ms->initrd2_filename);
++    ms->initrd2_filename = g_strdup(value);
++}
++
++static char *machine_get_append2(Object *obj, Error **errp)
++{
++    MachineState *ms = MACHINE(obj);
++
++    return g_strdup(ms->kernel2_cmdline);
++}
++
++static void machine_set_append2(Object *obj, const char *value, Error **errp)
++{
++    MachineState *ms = MACHINE(obj);
++
++    g_free(ms->kernel2_cmdline);
++    ms->kernel2_cmdline = g_strdup(value);
++}
++
+ static char *machine_get_dtb(Object *obj, Error **errp)
+ {
+     MachineState *ms = MACHINE(obj);
+@@ -992,6 +1037,21 @@ static void machine_class_init(ObjectClass *oc, void *data)
+     object_class_property_set_description(oc, "append",
+         "Linux kernel command line");
+ 
++    object_class_property_add_str(oc, "kernel2",
++        machine_get_kernel2, machine_set_kernel2);
++    object_class_property_set_description(oc, "kernel2",
++        "Linux kernel 2 image file");
++
++    object_class_property_add_str(oc, "initrd2",
++        machine_get_initrd2, machine_set_initrd2);
++    object_class_property_set_description(oc, "initrd2",
++        "Linux initial ramdisk 2 file");
++
++    object_class_property_add_str(oc, "append2",
++        machine_get_append2, machine_set_append2);
++    object_class_property_set_description(oc, "append2",
++        "Linux kernel 2 command line");
++
+     object_class_property_add_str(oc, "dtb",
+         machine_get_dtb, machine_set_dtb);
+     object_class_property_set_description(oc, "dtb",
+@@ -1111,6 +1171,7 @@ static void machine_initfn(Object *obj)
+     ms->mem_merge = true;
+     ms->enable_graphics = true;
+     ms->kernel_cmdline = g_strdup("");
++    ms->kernel2_cmdline = g_strdup("");
+     ms->ram_size = mc->default_ram_size;
+     ms->maxram_size = mc->default_ram_size;
+ 
+@@ -1162,6 +1223,9 @@ static void machine_finalize(Object *obj)
+     g_free(ms->kernel_filename);
+     g_free(ms->initrd_filename);
+     g_free(ms->kernel_cmdline);
++    g_free(ms->kernel2_filename);
++    g_free(ms->initrd2_filename);
++    g_free(ms->kernel2_cmdline);
+     g_free(ms->dtb);
+     g_free(ms->dumpdtb);
+     g_free(ms->dt_compatible);
+diff --git a/hw/i386/acpi-build.c b/hw/i386/acpi-build.c
+index 16c12424ed..e807083154 100644
+--- a/hw/i386/acpi-build.c
++++ b/hw/i386/acpi-build.c
+@@ -70,6 +70,7 @@
+ #include "hw/acpi/cxl.h"
+ 
+ #include "qom/qom-qobject.h"
++#include "kvm/tdx.h"
+ #include "hw/i386/amd_iommu.h"
+ #include "hw/i386/intel_iommu.h"
+ #include "hw/virtio/virtio-iommu.h"
+@@ -79,6 +80,24 @@
+ 
+ #include CONFIG_DEVICES
+ 
++static uint32_t hyc3_l2_cpu_aml_limit(MachineState *machine)
++{
++#ifdef CONFIG_TDX
++    TdxGuest *tdx;
++
++    if (!is_tdx_vm() || !machine->cgs) {
++        return 0;
++    }
++
++    tdx = TDX_GUEST(machine->cgs);
++    if (tdx->svsm_enabled && tdx->num_l2_vms == 2) {
++        return 2;
++    }
++#endif
++
++    return 0;
++}
++
+ /* These are used to size the ACPI tables for -M pc-i440fx-1.7 and
+  * -M pc-i440fx-2.0.  Even if the actual amount of AML generated grows
+  * a little bit, there should be plenty of free space since the DSDT
+@@ -1567,6 +1586,7 @@ build_dsdt(GArray *table_data, BIOSLinker *linker,
+             .acpi_1_compatible = true, .has_legacy_cphp = true,
+             .smi_path = pm->smi_on_cpuhp ? "\\_SB.PCI0.SMI0.SMIC" : NULL,
+             .fw_unplugs_cpu = pm->smi_on_cpu_unplug,
++            .cpu_count_limit = hyc3_l2_cpu_aml_limit(machine),
+         };
+         build_cpus_aml(dsdt, machine, opts, pc_madt_cpu_entry,
+                        pm->cpu_hp_io_base, "\\_SB.PCI0", "\\_GPE._E02");
+diff --git a/hw/i386/e820_memory_layout.c b/hw/i386/e820_memory_layout.c
+index 06970ac44a..6f81be1662 100644
+--- a/hw/i386/e820_memory_layout.c
++++ b/hw/i386/e820_memory_layout.c
+@@ -15,6 +15,19 @@ struct e820_entry *e820_table;
+ 
+ int e820_add_entry(uint64_t address, uint64_t length, uint32_t type)
+ {
++    if (type == E820_RAM) {
++        if (address < 0x800000 && address + length > 0x800000) {
++            // Split it to reserve 0x800000 - 0xA00000
++            uint64_t end = address + length;
++            e820_add_entry(address, 0x800000 - address, E820_RAM);
++            e820_add_entry(0x800000, 0x200000, E820_RESERVED);
++            if (end > 0xA00000) {
++                e820_add_entry(0xA00000, end - 0xA00000, E820_RAM);
++            }
++            return e820_get_num_entries();
++        }
++    }
++
+     /* new "etc/e820" file -- include ram and reserved entries */
+     e820_table = g_renew(struct e820_entry, e820_table, e820_entries + 1);
+     e820_table[e820_entries].address = cpu_to_le64(address);
+diff --git a/hw/i386/kvm/apic.c b/hw/i386/kvm/apic.c
+index a72c28e8a7..3cb5d43943 100644
+--- a/hw/i386/kvm/apic.c
++++ b/hw/i386/kvm/apic.c
+@@ -11,12 +11,20 @@
+  */
+ 
+ #include "qemu/osdep.h"
++
++static bool hyc3_qemu_debug_enabled(void)
++{
++    const char *debug = getenv("HYC3_QEMU_DEBUG");
++
++    return debug && debug[0] && strcmp(debug, "0") != 0;
++}
+ #include "qemu/module.h"
+ #include "hw/i386/apic_internal.h"
+ #include "hw/pci/msi.h"
+ #include "sysemu/hw_accel.h"
+ #include "sysemu/kvm.h"
+ #include "kvm/kvm_i386.h"
++#include "kvm/tdx.h"
+ 
+ static inline void kvm_apic_set_reg(struct kvm_lapic_state *kapic,
+                                     int reg_id, uint32_t val)
+@@ -179,8 +187,36 @@ static void kvm_apic_external_nmi(APICCommonState *s)
+     run_on_cpu(CPU(s->cpu), do_inject_external_nmi, RUN_ON_CPU_HOST_PTR(s));
+ }
+ 
+-static void kvm_send_msi(MSIMessage *msg)
++#define HYC3_MSI_ADDR_DEST_ID_MASK  0x000ff000ULL
++#define HYC3_MSI_ADDR_DEST_ID_SHIFT 12
++#define HYC3_L2_2_MSI_DEST_ID       4ULL
++
++static bool hyc3_tdx_l2_2_requester_id(uint32_t requester_id)
++{
++    uint8_t bus = requester_id >> 8;
++    uint8_t devfn = requester_id & 0xff;
++    uint8_t slot = PCI_SLOT(devfn);
++
++    return is_tdx_vm() && bus == 0 && (slot == 4 || slot == 6);
++}
++
++static void hyc3_encode_l2_2_msi_msg(MSIMessage *msg, MemTxAttrs attrs)
+ {
++    if (hyc3_tdx_l2_2_requester_id(attrs.requester_id)) {
++        msg->address &= ~HYC3_MSI_ADDR_DEST_ID_MASK;
++        msg->address |= HYC3_L2_2_MSI_DEST_ID << HYC3_MSI_ADDR_DEST_ID_SHIFT;
++    }
++}
++
++static void kvm_send_msi_with_attrs(MSIMessage *msg, MemTxAttrs attrs)
++{
++    static unsigned int hyc3_tdx_msi_devid_18_logs;
++    static unsigned int hyc3_tdx_msi_devid_20_logs;
++    static unsigned int hyc3_tdx_msi_devid_other_logs;
++    static unsigned int hyc3_tdx_msi_nodevid_logs;
++    bool use_devid = is_tdx_vm() && attrs.requester_id;
++    unsigned int *log_count;
++    unsigned int log_limit;
+     int ret;
+ 
+     /*
+@@ -189,34 +225,81 @@ static void kvm_send_msi(MSIMessage *msg)
+      * handled.
+      */
+     msg->address = kvm_swizzle_msi_ext_dest_id(msg->address);
++    hyc3_encode_l2_2_msi_msg(msg, attrs);
++
++    if (use_devid) {
++
++        if (attrs.requester_id == 0x18) {
++
++            log_count = &hyc3_tdx_msi_devid_18_logs;
++
++            log_limit = 8;
++
++        } else if (attrs.requester_id == 0x20) {
++
++            log_count = &hyc3_tdx_msi_devid_20_logs;
++
++            log_limit = 128;
++
++        } else {
++
++            log_count = &hyc3_tdx_msi_devid_other_logs;
++
++            log_limit = 16;
++
++        }
++
++        if (hyc3_qemu_debug_enabled() && (*log_count)++ < log_limit) {
++            fprintf(stderr,
++                    "HYC3-KVM-MSI devid=0x%x addr=0x%" PRIx64 " data=0x%x use_devid=1\n",
++                    attrs.requester_id, msg->address, msg->data);
++        }
++        ret = kvm_irqchip_send_msi_with_devid(kvm_state, *msg,
++
++                                              attrs.requester_id);
++
++    } else {
++
++        if (is_tdx_vm() && hyc3_qemu_debug_enabled() && hyc3_tdx_msi_nodevid_logs++ < 128) {
++            fprintf(stderr,
++                    "HYC3-KVM-MSI addr=0x%" PRIx64 " data=0x%x use_devid=0\n",
++                    msg->address, msg->data);
++        }
++        ret = kvm_irqchip_send_msi(kvm_state, *msg);
++    }
+ 
+-    ret = kvm_irqchip_send_msi(kvm_state, *msg);
+     if (ret < 0) {
+         fprintf(stderr, "KVM: injection failed, MSI lost (%s)\n",
+                 strerror(-ret));
+     }
+ }
+ 
++static void kvm_send_msi(MSIMessage *msg)
++{
++    kvm_send_msi_with_attrs(msg, MEMTXATTRS_UNSPECIFIED);
++}
+ static uint64_t kvm_apic_mem_read(void *opaque, hwaddr addr,
+                                   unsigned size)
+ {
+     return ~(uint64_t)0;
+ }
+ 
+-static void kvm_apic_mem_write(void *opaque, hwaddr addr,
+-                               uint64_t data, unsigned size)
++
++static MemTxResult kvm_apic_mem_write_with_attrs(void *opaque, hwaddr addr,
++                                                 uint64_t data, unsigned size,
++                                                 MemTxAttrs attrs)
+ {
+     MSIMessage msg = { .address = addr, .data = data };
+ 
+-    kvm_send_msi(&msg);
++    kvm_send_msi_with_attrs(&msg, attrs);
++    return MEMTX_OK;
+ }
+ 
+ static const MemoryRegionOps kvm_apic_io_ops = {
+     .read = kvm_apic_mem_read,
+-    .write = kvm_apic_mem_write,
++    .write_with_attrs = kvm_apic_mem_write_with_attrs,
+     .endianness = DEVICE_NATIVE_ENDIAN,
+ };
+-
+ static void kvm_apic_reset(APICCommonState *s)
+ {
+     /* Not used by KVM, which uses the CPU mp_state instead.  */
+diff --git a/hw/i386/pc.c b/hw/i386/pc.c
+index 1af0fa064c..b4a0a294c1 100644
+--- a/hw/i386/pc.c
++++ b/hw/i386/pc.c
+@@ -881,6 +881,8 @@ static hwaddr pc_max_used_gpa(PCMachineState *pcms, uint64_t pci_hole64_size)
+ #define AMD_ABOVE_1TB_START  (AMD_HT_END + 1)
+ #define AMD_HT_SIZE          (AMD_ABOVE_1TB_START - AMD_HT_START)
+ 
++void x86_load_linux2(X86MachineState *x86ms, FWCfgState *fw_cfg);
++
+ void pc_memory_init(PCMachineState *pcms,
+                     MemoryRegion *system_memory,
+                     MemoryRegion *rom_memory,
+@@ -1067,6 +1069,7 @@ void pc_memory_init(PCMachineState *pcms,
+     if (linux_boot) {
+         x86_load_linux(x86ms, fw_cfg, pcmc->acpi_data_size,
+                        pcmc->pvh_enabled);
++        x86_load_linux2(x86ms, fw_cfg);
+     }
+ 
+     for (i = 0; i < nb_option_roms; i++) {
+diff --git a/hw/i386/x86.c b/hw/i386/x86.c
+index 23ed1a7a09..47f6e24f3f 100644
+--- a/hw/i386/x86.c
++++ b/hw/i386/x86.c
+@@ -1547,3 +1547,4 @@ static void x86_machine_register_types(void)
+ }
+ 
+ type_init(x86_machine_register_types)
++#include "x86_kernel2.c"
+diff --git a/hw/nvram/fw_cfg.c b/hw/nvram/fw_cfg.c
+index fc0263f349..779adedc1b 100644
+--- a/hw/nvram/fw_cfg.c
++++ b/hw/nvram/fw_cfg.c
+@@ -43,6 +43,7 @@
+ #include "hw/acpi/aml-build.h"
+ #include "hw/pci/pci_bus.h"
+ #include "hw/loader.h"
++#include "hw/core/cpu.h"
+ 
+ #define FW_CFG_FILE_SLOTS_DFLT 0x20
+ 
+@@ -68,6 +69,13 @@ struct FWCfgEntry {
+     FWCfgWriteCallback write_cb;
+ };
+ 
++enum {
++    FW_CFG_HYC3_L2_ALIAS_KERNEL = 0,
++    FW_CFG_HYC3_L2_ALIAS_SETUP,
++    FW_CFG_HYC3_L2_ALIAS_INITRD,
++    FW_CFG_HYC3_L2_ALIAS_CMDLINE,
++};
++
+ /**
+  * key_name:
+  *
+@@ -124,6 +132,126 @@ static inline const char *trace_key_name(uint16_t key)
+     return name ? name : "unknown";
+ }
+ 
++static unsigned int fw_cfg_vcpu_index(void)
++{
++    if (current_cpu && current_cpu->cpu_index >= 0 &&
++        current_cpu->cpu_index < FW_CFG_MAX_VCPU_STATES) {
++        return current_cpu->cpu_index;
++    }
++
++    return 0;
++}
++
++static dma_addr_t fw_cfg_hyc3_dma_addr(FWCfgState *s, dma_addr_t addr)
++{
++    if (s->hyc3_l2_dma_gpa_offset && current_cpu &&
++        current_cpu->cpu_index >= s->hyc3_l2_dma_first_cpu) {
++        return addr + s->hyc3_l2_dma_gpa_offset;
++    }
++
++    return addr;
++}
++
++static bool fw_cfg_hyc3_l2_fw_cfg_active(FWCfgState *s)
++{
++    return s->hyc3_l2_fw_cfg_alias && s->hyc3_l2_fw_cfg_primary_done &&
++           current_cpu && current_cpu->cpu_index >= s->hyc3_l2_fw_cfg_first_cpu;
++}
++
++static int fw_cfg_hyc3_l2_alias_index(uint16_t key, bool *is_size)
++{
++    if (key & (FW_CFG_ARCH_LOCAL | FW_CFG_WRITE_CHANNEL)) {
++        return -1;
++    }
++
++    *is_size = false;
++    switch (key & FW_CFG_ENTRY_MASK) {
++    case FW_CFG_KERNEL_SIZE:
++        *is_size = true;
++        return FW_CFG_HYC3_L2_ALIAS_KERNEL;
++    case FW_CFG_KERNEL_DATA:
++        return FW_CFG_HYC3_L2_ALIAS_KERNEL;
++    case FW_CFG_SETUP_SIZE:
++        *is_size = true;
++        return FW_CFG_HYC3_L2_ALIAS_SETUP;
++    case FW_CFG_SETUP_DATA:
++        return FW_CFG_HYC3_L2_ALIAS_SETUP;
++    case FW_CFG_INITRD_SIZE:
++        *is_size = true;
++        return FW_CFG_HYC3_L2_ALIAS_INITRD;
++    case FW_CFG_INITRD_DATA:
++        return FW_CFG_HYC3_L2_ALIAS_INITRD;
++    case FW_CFG_CMDLINE_SIZE:
++        *is_size = true;
++        return FW_CFG_HYC3_L2_ALIAS_CMDLINE;
++    case FW_CFG_CMDLINE_DATA:
++        return FW_CFG_HYC3_L2_ALIAS_CMDLINE;
++    default:
++        return -1;
++    }
++}
++
++#define HYC3_FW_CFG_PRIMARY_ALL ((1u << FW_CFG_HYC3_L2_ALIAS_COUNT) - 1u)
++
++static void fw_cfg_hyc3_maybe_finish_primary_boot(FWCfgState *s, uint16_t key,
++                                                  uint32_t offset,
++                                                  FWCfgEntry *e)
++{
++    bool is_size;
++    int alias_index;
++    uint8_t bit;
++
++    if (!s->hyc3_l2_fw_cfg_alias || s->hyc3_l2_fw_cfg_primary_done || !e) {
++        return;
++    }
++
++    if ((key & (FW_CFG_ARCH_LOCAL | FW_CFG_WRITE_CHANNEL)) != 0) {
++        return;
++    }
++
++    alias_index = fw_cfg_hyc3_l2_alias_index(key, &is_size);
++    if (alias_index < 0 || is_size || offset < e->len) {
++        return;
++    }
++
++    bit = 1u << alias_index;
++    if (s->hyc3_l2_fw_cfg_primary_seen & bit) {
++        return;
++    }
++
++    s->hyc3_l2_fw_cfg_primary_seen |= bit;
++    warn_report("HYC3: primary fw_cfg blob %d consumed mask=0x%x",
++                alias_index, s->hyc3_l2_fw_cfg_primary_seen);
++
++    if ((s->hyc3_l2_fw_cfg_primary_seen & HYC3_FW_CFG_PRIMARY_ALL) ==
++        HYC3_FW_CFG_PRIMARY_ALL) {
++        s->hyc3_l2_fw_cfg_primary_done = true;
++        warn_report("HYC3: primary fw_cfg boot blobs consumed; L2-2 alias is active");
++    }
++}
++
++static uint16_t *fw_cfg_cur_entry_ptr(FWCfgState *s)
++{
++    return &s->cur_entry_by_cpu[fw_cfg_vcpu_index()];
++}
++
++static uint32_t *fw_cfg_cur_offset_ptr(FWCfgState *s)
++{
++    return &s->cur_offset_by_cpu[fw_cfg_vcpu_index()];
++}
++
++static dma_addr_t *fw_cfg_dma_addr_ptr(FWCfgState *s)
++{
++    return &s->dma_addr_by_cpu[fw_cfg_vcpu_index()];
++}
++
++static void fw_cfg_sync_legacy_state(FWCfgState *s)
++{
++    s->cur_entry = *fw_cfg_cur_entry_ptr(s);
++    s->cur_offset = *fw_cfg_cur_offset_ptr(s);
++    s->dma_addr = *fw_cfg_dma_addr_ptr(s);
++}
++
+ #define JPG_FILE 0
+ #define BMP_FILE 1
+ 
+@@ -267,26 +395,62 @@ static inline uint32_t fw_cfg_max_entry(const FWCfgState *s)
+     return FW_CFG_FILE_FIRST + fw_cfg_file_slots(s);
+ }
+ 
++static FWCfgEntry *fw_cfg_entry_for_key(FWCfgState *s, uint16_t key)
++{
++    int arch = !!(key & FW_CFG_ARCH_LOCAL);
++    uint16_t masked = key & FW_CFG_ENTRY_MASK;
++    bool is_size = false;
++    int alias_index;
++    uint16_t alias_key;
++
++    if (masked >= fw_cfg_max_entry(s)) {
++        return NULL;
++    }
++
++    alias_index = fw_cfg_hyc3_l2_alias_index(key, &is_size);
++    if (fw_cfg_hyc3_l2_fw_cfg_active(s) && alias_index >= 0) {
++        if (is_size) {
++            if (!s->hyc3_l2_alias_size_entries) {
++                return NULL;
++            }
++            return &s->hyc3_l2_alias_size_entries[alias_index];
++        }
++
++        alias_key = s->hyc3_l2_alias_data_key[alias_index];
++        if (alias_key == FW_CFG_INVALID ||
++            (alias_key & FW_CFG_ARCH_LOCAL) ||
++            (alias_key & FW_CFG_ENTRY_MASK) >= fw_cfg_max_entry(s)) {
++            return NULL;
++        }
++
++        return &s->entries[0][alias_key & FW_CFG_ENTRY_MASK];
++    }
++
++    return &s->entries[arch][masked];
++}
++
+ static int fw_cfg_select(FWCfgState *s, uint16_t key)
+ {
+-    int arch, ret;
++    int ret;
+     FWCfgEntry *e;
++    uint16_t *cur_entry = fw_cfg_cur_entry_ptr(s);
++    uint32_t *cur_offset = fw_cfg_cur_offset_ptr(s);
+ 
+-    s->cur_offset = 0;
++    *cur_offset = 0;
+     if ((key & FW_CFG_ENTRY_MASK) >= fw_cfg_max_entry(s)) {
+-        s->cur_entry = FW_CFG_INVALID;
++        *cur_entry = FW_CFG_INVALID;
+         ret = 0;
+     } else {
+-        s->cur_entry = key;
++        *cur_entry = key;
+         ret = 1;
+         /* entry successfully selected, now run callback if present */
+-        arch = !!(key & FW_CFG_ARCH_LOCAL);
+-        e = &s->entries[arch][key & FW_CFG_ENTRY_MASK];
+-        if (e->select_cb) {
++        e = fw_cfg_entry_for_key(s, key);
++        if (e && e->select_cb) {
+             e->select_cb(e->callback_opaque);
+         }
+     }
+ 
++    fw_cfg_sync_legacy_state(s);
+     trace_fw_cfg_select(s, key, trace_key_name(key), ret);
+     return ret;
+ }
+@@ -294,13 +458,14 @@ static int fw_cfg_select(FWCfgState *s, uint16_t key)
+ static uint64_t fw_cfg_data_read(void *opaque, hwaddr addr, unsigned size)
+ {
+     FWCfgState *s = opaque;
+-    int arch = !!(s->cur_entry & FW_CFG_ARCH_LOCAL);
+-    FWCfgEntry *e = (s->cur_entry == FW_CFG_INVALID) ? NULL :
+-                    &s->entries[arch][s->cur_entry & FW_CFG_ENTRY_MASK];
++    uint16_t *cur_entry = fw_cfg_cur_entry_ptr(s);
++    uint32_t *cur_offset = fw_cfg_cur_offset_ptr(s);
++    FWCfgEntry *e = (*cur_entry == FW_CFG_INVALID) ? NULL :
++                    fw_cfg_entry_for_key(s, *cur_entry);
+     uint64_t value = 0;
+ 
+     assert(size > 0 && size <= sizeof(value));
+-    if (s->cur_entry != FW_CFG_INVALID && e->data && s->cur_offset < e->len) {
++    if (*cur_entry != FW_CFG_INVALID && e->data && *cur_offset < e->len) {
+         /* The least significant 'size' bytes of the return value are
+          * expected to contain a string preserving portion of the item
+          * data, padded with zeros on the right in case we run out early.
+@@ -308,8 +473,8 @@ static uint64_t fw_cfg_data_read(void *opaque, hwaddr addr, unsigned size)
+          * of the big endian interpretation of the fw_cfg string.
+          */
+         do {
+-            value = (value << 8) | e->data[s->cur_offset++];
+-        } while (--size && s->cur_offset < e->len);
++            value = (value << 8) | e->data[(*cur_offset)++];
++        } while (--size && *cur_offset < e->len);
+         /* If size is still not zero, we *did* run out early, so continue
+          * left-shifting, to add the appropriate number of padding zeros
+          * on the right.
+@@ -317,6 +482,8 @@ static uint64_t fw_cfg_data_read(void *opaque, hwaddr addr, unsigned size)
+         value <<= 8 * size;
+     }
+ 
++    fw_cfg_hyc3_maybe_finish_primary_boot(s, *cur_entry, *cur_offset, e);
++    fw_cfg_sync_legacy_state(s);
+     trace_fw_cfg_read(s, value);
+     return value;
+ }
+@@ -336,18 +503,23 @@ static void fw_cfg_dma_transfer(FWCfgState *s)
+ {
+     dma_addr_t len;
+     FWCfgDmaAccess dma;
+-    int arch;
+     FWCfgEntry *e;
+     int read = 0, write = 0;
+     dma_addr_t dma_addr;
++    dma_addr_t dma_desc_addr;
++    dma_addr_t *dma_addr_slot = fw_cfg_dma_addr_ptr(s);
++    uint16_t *cur_entry;
++    uint32_t *cur_offset;
+ 
+     /* Reset the address before the next access */
+-    dma_addr = s->dma_addr;
+-    s->dma_addr = 0;
++    dma_addr = *dma_addr_slot;
++    dma_desc_addr = fw_cfg_hyc3_dma_addr(s, dma_addr);
++    *dma_addr_slot = 0;
++    fw_cfg_sync_legacy_state(s);
+ 
+-    if (dma_memory_read(s->dma_as, dma_addr,
++    if (dma_memory_read(s->dma_as, dma_desc_addr,
+                         &dma, sizeof(dma), MEMTXATTRS_UNSPECIFIED)) {
+-        stl_be_dma(s->dma_as, dma_addr + offsetof(FWCfgDmaAccess, control),
++        stl_be_dma(s->dma_as, dma_desc_addr + offsetof(FWCfgDmaAccess, control),
+                    FW_CFG_DMA_CTL_ERROR, MEMTXATTRS_UNSPECIFIED);
+         return;
+     }
+@@ -360,9 +532,10 @@ static void fw_cfg_dma_transfer(FWCfgState *s)
+         fw_cfg_select(s, dma.control >> 16);
+     }
+ 
+-    arch = !!(s->cur_entry & FW_CFG_ARCH_LOCAL);
+-    e = (s->cur_entry == FW_CFG_INVALID) ? NULL :
+-        &s->entries[arch][s->cur_entry & FW_CFG_ENTRY_MASK];
++    cur_entry = fw_cfg_cur_entry_ptr(s);
++    cur_offset = fw_cfg_cur_offset_ptr(s);
++    e = (*cur_entry == FW_CFG_INVALID) ? NULL :
++        fw_cfg_entry_for_key(s, *cur_entry);
+ 
+     if (dma.control & FW_CFG_DMA_CTL_READ) {
+         read = 1;
+@@ -380,15 +553,17 @@ static void fw_cfg_dma_transfer(FWCfgState *s)
+     dma.control = 0;
+ 
+     while (dma.length > 0 && !(dma.control & FW_CFG_DMA_CTL_ERROR)) {
+-        if (s->cur_entry == FW_CFG_INVALID || !e->data ||
+-                                s->cur_offset >= e->len) {
++        dma_addr_t dma_guest_addr = fw_cfg_hyc3_dma_addr(s, dma.address);
++
++        if (*cur_entry == FW_CFG_INVALID || !e->data ||
++                                *cur_offset >= e->len) {
+             len = dma.length;
+ 
+             /* If the access is not a read access, it will be a skip access,
+              * tested before.
+              */
+             if (read) {
+-                if (dma_memory_set(s->dma_as, dma.address, 0, len,
++                if (dma_memory_set(s->dma_as, dma_guest_addr, 0, len,
+                                    MEMTXATTRS_UNSPECIFIED)) {
+                     dma.control |= FW_CFG_DMA_CTL_ERROR;
+                 }
+@@ -397,18 +572,18 @@ static void fw_cfg_dma_transfer(FWCfgState *s)
+                 dma.control |= FW_CFG_DMA_CTL_ERROR;
+             }
+         } else {
+-            if (dma.length <= (e->len - s->cur_offset)) {
++            if (dma.length <= (e->len - *cur_offset)) {
+                 len = dma.length;
+             } else {
+-                len = (e->len - s->cur_offset);
++                len = (e->len - *cur_offset);
+             }
+ 
+             /* If the access is not a read access, it will be a skip access,
+              * tested before.
+              */
+             if (read) {
+-                if (dma_memory_write(s->dma_as, dma.address,
+-                                     &e->data[s->cur_offset], len,
++                if (dma_memory_write(s->dma_as, dma_guest_addr,
++                                     &e->data[*cur_offset], len,
+                                      MEMTXATTRS_UNSPECIFIED)) {
+                     dma.control |= FW_CFG_DMA_CTL_ERROR;
+                 }
+@@ -416,16 +591,16 @@ static void fw_cfg_dma_transfer(FWCfgState *s)
+             if (write) {
+                 if (!e->allow_write ||
+                     len != dma.length ||
+-                    dma_memory_read(s->dma_as, dma.address,
+-                                    &e->data[s->cur_offset], len,
++                    dma_memory_read(s->dma_as, dma_guest_addr,
++                                    &e->data[*cur_offset], len,
+                                     MEMTXATTRS_UNSPECIFIED)) {
+                     dma.control |= FW_CFG_DMA_CTL_ERROR;
+                 } else if (e->write_cb) {
+-                    e->write_cb(e->callback_opaque, s->cur_offset, len);
++                    e->write_cb(e->callback_opaque, *cur_offset, len);
+                 }
+             }
+ 
+-            s->cur_offset += len;
++            *cur_offset += len;
+         }
+ 
+         dma.address += len;
+@@ -433,9 +608,11 @@ static void fw_cfg_dma_transfer(FWCfgState *s)
+ 
+     }
+ 
+-    stl_be_dma(s->dma_as, dma_addr + offsetof(FWCfgDmaAccess, control),
++    stl_be_dma(s->dma_as, dma_desc_addr + offsetof(FWCfgDmaAccess, control),
+                 dma.control, MEMTXATTRS_UNSPECIFIED);
+ 
++    fw_cfg_hyc3_maybe_finish_primary_boot(s, *cur_entry, *cur_offset, e);
++    fw_cfg_sync_legacy_state(s);
+     trace_fw_cfg_read(s, 0);
+ }
+ 
+@@ -450,18 +627,21 @@ static void fw_cfg_dma_mem_write(void *opaque, hwaddr addr,
+                                  uint64_t value, unsigned size)
+ {
+     FWCfgState *s = opaque;
++    dma_addr_t *dma_addr = fw_cfg_dma_addr_ptr(s);
+ 
+     if (size == 4) {
+         if (addr == 0) {
+             /* FWCfgDmaAccess high address */
+-            s->dma_addr = value << 32;
++            *dma_addr = value << 32;
+         } else if (addr == 4) {
+             /* FWCfgDmaAccess low address */
+-            s->dma_addr |= value;
++            *dma_addr |= value;
++            fw_cfg_sync_legacy_state(s);
+             fw_cfg_dma_transfer(s);
+         }
+     } else if (size == 8 && addr == 0) {
+-        s->dma_addr = value;
++        *dma_addr = value;
++        fw_cfg_sync_legacy_state(s);
+         fw_cfg_dma_transfer(s);
+     }
+ }
+@@ -556,6 +736,13 @@ static const MemoryRegionOps fw_cfg_dma_mem_ops = {
+ static void fw_cfg_reset(DeviceState *d)
+ {
+     FWCfgState *s = FW_CFG(d);
++    unsigned int cpu_index;
++
++    for (cpu_index = 0; cpu_index < FW_CFG_MAX_VCPU_STATES; cpu_index++) {
++        s->cur_entry_by_cpu[cpu_index] = FW_CFG_SIGNATURE;
++        s->cur_offset_by_cpu[cpu_index] = 0;
++        s->dma_addr_by_cpu[cpu_index] = 0;
++    }
+ 
+     /* we never register a read callback for FW_CFG_SIGNATURE */
+     fw_cfg_select(s, FW_CFG_SIGNATURE);
+@@ -605,6 +792,89 @@ bool fw_cfg_dma_enabled(void *opaque)
+     return s->dma_enabled;
+ }
+ 
++void fw_cfg_set_hyc3_l2_dma_offset(FWCfgState *s, unsigned int first_vcpu_index,
++                                   uint64_t offset)
++{
++    s->hyc3_l2_dma_first_cpu = first_vcpu_index;
++    s->hyc3_l2_dma_gpa_offset = offset;
++}
++
++static bool fw_cfg_hyc3_lookup_file(FWCfgState *s, const char *name,
++                                     uint16_t *key, uint32_t *size)
++{
++    uint32_t count;
++    uint32_t i;
++
++    if (!s->files) {
++        return false;
++    }
++
++    count = be32_to_cpu(s->files->count);
++    for (i = 0; i < count; i++) {
++        if (!strcmp(s->files->f[i].name, name)) {
++            *key = be16_to_cpu(s->files->f[i].select);
++            *size = be32_to_cpu(s->files->f[i].size);
++            return true;
++        }
++    }
++
++    return false;
++}
++
++void fw_cfg_set_hyc3_l2_kernel_alias(FWCfgState *s,
++                                      unsigned int first_vcpu_index)
++{
++    static const char * const names[FW_CFG_HYC3_L2_ALIAS_COUNT] = {
++        [FW_CFG_HYC3_L2_ALIAS_KERNEL] = "opt/kernel2",
++        [FW_CFG_HYC3_L2_ALIAS_SETUP] = "opt/setup2",
++        [FW_CFG_HYC3_L2_ALIAS_INITRD] = "opt/initrd2",
++        [FW_CFG_HYC3_L2_ALIAS_CMDLINE] = "opt/cmdline2",
++    };
++    uint16_t key[FW_CFG_HYC3_L2_ALIAS_COUNT];
++    uint32_t size[FW_CFG_HYC3_L2_ALIAS_COUNT];
++    int i;
++
++    for (i = 0; i < FW_CFG_HYC3_L2_ALIAS_COUNT; i++) {
++        key[i] = FW_CFG_INVALID;
++        size[i] = 0;
++
++        if (!names[i]) {
++            continue;
++        }
++
++        if (!fw_cfg_hyc3_lookup_file(s, names[i], &key[i], &size[i])) {
++            warn_report("HYC3: missing fw_cfg file %s; L2-2 kernel alias disabled",
++                        names[i]);
++            s->hyc3_l2_fw_cfg_alias = false;
++            return;
++        }
++    }
++
++    if (!s->hyc3_l2_alias_size_entries) {
++        s->hyc3_l2_alias_size_entries =
++            g_new0(FWCfgEntry, FW_CFG_HYC3_L2_ALIAS_COUNT);
++    }
++
++    for (i = 0; i < FW_CFG_HYC3_L2_ALIAS_COUNT; i++) {
++        s->hyc3_l2_alias_data_key[i] = key[i];
++        s->hyc3_l2_alias_size_le[i] = cpu_to_le32(size[i]);
++        s->hyc3_l2_alias_size_entries[i].len = sizeof(uint32_t);
++        s->hyc3_l2_alias_size_entries[i].allow_write = false;
++        s->hyc3_l2_alias_size_entries[i].data =
++            (uint8_t *)&s->hyc3_l2_alias_size_le[i];
++        s->hyc3_l2_alias_size_entries[i].callback_opaque = NULL;
++        s->hyc3_l2_alias_size_entries[i].select_cb = NULL;
++        s->hyc3_l2_alias_size_entries[i].write_cb = NULL;
++    }
++
++    s->hyc3_l2_fw_cfg_primary_done = false;
++    s->hyc3_l2_fw_cfg_primary_seen = 0;
++    s->hyc3_l2_fw_cfg_first_cpu = first_vcpu_index;
++    s->hyc3_l2_fw_cfg_alias = true;
++    warn_report("HYC3: enabled L2-2 fw_cfg kernel alias from vCPU %u",
++                first_vcpu_index);
++}
++
+ static bool fw_cfg_acpi_mr_restore(void *opaque)
+ {
+     FWCfgState *s = opaque;
+diff --git a/hw/pci/msix.c b/hw/pci/msix.c
+index 487e49834e..71ddaf707d 100644
+--- a/hw/pci/msix.c
++++ b/hw/pci/msix.c
+@@ -26,6 +26,20 @@
+ #include "qapi/error.h"
+ #include "trace.h"
+ 
++extern bool is_tdx_vm(void);
++
++static bool hyc3_qemu_debug_enabled(void)
++{
++    const char *debug = getenv("HYC3_QEMU_DEBUG");
++
++    return debug && debug[0] && strcmp(debug, "0") != 0;
++}
++
++static const char *hyc3_msix_dev_id(PCIDevice *dev)
++{
++    return dev->qdev.id ? dev->qdev.id : "-";
++}
++
+ #include "hw/i386/kvm/xen_evtchn.h"
+ 
+ /* MSI enable bit and maskall bit are in byte 1 in FLAGS register */
+@@ -528,6 +542,21 @@ void msix_notify(PCIDevice *dev, unsigned vector)
+ 
+     assert(vector < dev->msix_entries_nr);
+ 
++    if (is_tdx_vm() && hyc3_qemu_debug_enabled()) {
++        static unsigned int hyc3_tdx_msix_logs;
++        MSIMessage dbg = msix_get_message(dev, vector);
++
++        if (hyc3_tdx_msix_logs++ < 512) {
++            uint32_t rid = pci_requester_id(dev);
++            fprintf(stderr,
++                    "HYC3-MSIX-NOTIFY: dev=%s id=%s rid=0x%x slot=%u fn=%u vector=%u entries=%u used=%d masked=%d addr=0x%" PRIx64 " data=0x%x\n",
++                    dev->name, hyc3_msix_dev_id(dev), rid, PCI_SLOT(rid & 0xff),
++                    PCI_FUNC(rid & 0xff), vector, dev->msix_entries_nr,
++                    dev->msix_entry_used[vector], msix_is_masked(dev, vector),
++                    dbg.address, dbg.data);
++        }
++    }
++
+     if (!dev->msix_entry_used[vector]) {
+         return;
+     }
+diff --git a/hw/scsi/vmw_pvscsi.c b/hw/scsi/vmw_pvscsi.c
+index cd7bf6aa01..9abfe9e8a5 100644
+--- a/hw/scsi/vmw_pvscsi.c
++++ b/hw/scsi/vmw_pvscsi.c
+@@ -146,6 +146,36 @@ typedef struct PVSCSIRequest {
+     QTAILQ_ENTRY(PVSCSIRequest) next;
+ } PVSCSIRequest;
+ 
++
++
++static void hyc3_pvscsi_log(PVSCSIState *s, const char *fmt, ...) G_GNUC_PRINTF(2, 3);
++
++static void hyc3_pvscsi_log(PVSCSIState *s, const char *fmt, ...)
++{
++    static int enabled = -1;
++    static unsigned int count;
++    PCIDevice *d = PCI_DEVICE(s);
++    va_list ap;
++
++    if (enabled < 0) {
++        const char *env = g_getenv("HYC3_PVSCSI_DEBUG");
++        enabled = env && env[0] == '1';
++    }
++    if (!enabled || count++ >= 256) {
++        return;
++    }
++
++    fprintf(stderr, "HYC3-PVSCSI %02x:%02x.%u: ",
++            pci_dev_bus_num(d), PCI_SLOT(d->devfn), PCI_FUNC(d->devfn));
++    va_start(ap, fmt);
++    vfprintf(stderr, fmt, ap);
++    va_end(ap);
++    fputc('\n', stderr);
++    fflush(stderr);
++}
++
++
++
+ /* Integer binary logarithm */
+ static int
+ pvscsi_log2(uint32_t input)
+@@ -367,6 +397,18 @@ pvscsi_update_irq_status(PVSCSIState *s)
+     trace_pvscsi_update_irq_level(should_raise, s->reg_interrupt_enabled,
+                                   s->reg_interrupt_status);
+ 
++    if (should_raise) {
++
++        hyc3_pvscsi_log(s, "irq raise mask=0x%" PRIx64 " status=0x%" PRIx64
++
++                        " msi=%d", s->reg_interrupt_enabled,
++
++                        s->reg_interrupt_status, msi_enabled(d));
++
++    }
++
++
++
+     if (msi_enabled(d)) {
+         if (should_raise) {
+             trace_pvscsi_update_irq_msi();
+@@ -430,12 +472,22 @@ pvscsi_process_completion_queue(void *opaque)
+     while (!QTAILQ_EMPTY(&s->completion_queue)) {
+         pvscsi_req = QTAILQ_FIRST(&s->completion_queue);
+         QTAILQ_REMOVE(&s->completion_queue, pvscsi_req, next);
++        hyc3_pvscsi_log(s, "cmp ctx=0x%" PRIx64 " host=0x%x scsi=0x%x len=%" PRIu64,
++
++                        pvscsi_req->cmp.context, pvscsi_req->cmp.hostStatus,
++
++                        pvscsi_req->cmp.scsiStatus, pvscsi_req->cmp.dataLen);
++
+         pvscsi_cmp_ring_put(s, &pvscsi_req->cmp);
+         g_free(pvscsi_req);
+         has_completed = true;
+     }
+ 
+     if (has_completed) {
++        hyc3_pvscsi_log(s, "flush-cmp filled=%" PRIu64,
++
++                        s->rings.filled_cmp_ptr);
++
+         pvscsi_ring_flush_cmp(&s->rings);
+         pvscsi_raise_completion_interrupt(s);
+     }
+@@ -468,6 +520,14 @@ pvscsi_complete_request(PVSCSIState *s, PVSCSIRequest *r)
+ 
+     trace_pvscsi_complete_request(r->cmp.context, r->cmp.dataLen,
+                                   r->sense_key);
++    hyc3_pvscsi_log(s, "complete cdb=0x%02x ctx=0x%" PRIx64
++
++                    " host=0x%x scsi=0x%x len=%" PRIu64, r->req.cdb[0],
++
++                    r->cmp.context, r->cmp.hostStatus, r->cmp.scsiStatus,
++
++                    r->cmp.dataLen);
++
+     if (r->sreq != NULL) {
+         scsi_req_unref(r->sreq);
+         r->sreq = NULL;
+@@ -567,11 +627,42 @@ pvscsi_command_complete(SCSIRequest *req, size_t resid)
+     s = pvscsi_req->dev;
+ 
+     if (resid) {
+-        /* Short transfer.  */
+-        trace_pvscsi_command_complete_data_run();
+-        pvscsi_req->cmp.hostStatus = BTSTAT_DATARUN;
++
++        uint64_t requested = pvscsi_req->req.dataLen;
++
++
++
++        pvscsi_req->cmp.dataLen = requested > resid ? requested - resid : 0;
++
++
++
++        if (req->status == GOOD || req->status == CHECK_CONDITION) {
++
++            hyc3_pvscsi_log(s,
++
++                            "short transfer ok cdb=0x%02x status=0x%x ctx=0x%" PRIx64
++
++                            " requested=%" PRIu64 " resid=%zu actual=%" PRIu64,
++
++                            pvscsi_req->req.cdb[0], req->status,
++
++                            pvscsi_req->cmp.context, requested, resid,
++
++                            pvscsi_req->cmp.dataLen);
++
++        } else {
++
++            /* Short transfer.  */
++
++            trace_pvscsi_command_complete_data_run();
++
++            pvscsi_req->cmp.hostStatus = BTSTAT_DATARUN;
++
++        }
++
+     }
+ 
++
+     pvscsi_req->cmp.scsiStatus = req->status;
+     if (pvscsi_req->cmp.scsiStatus == CHECK_CONDITION) {
+         uint8_t sense[SCSI_SENSE_BUF_SIZE];
+@@ -719,6 +810,18 @@ pvscsi_process_request_descriptor(PVSCSIState *s,
+ 
+     trace_pvscsi_process_req_descr(descr->cdb[0], descr->context);
+ 
++    hyc3_pvscsi_log(s, "req cdb=0x%02x ctx=0x%" PRIx64
++
++                    " bus=%u target=%u lun0=%u flags=0x%x data=0x%" PRIx64
++
++                    " len=%" PRIu64, descr->cdb[0], descr->context,
++
++                    descr->bus, descr->target, descr->lun[0], descr->flags,
++
++                    descr->dataAddr, descr->dataLen);
++
++
++
+     if (!d) {
+         r->cmp.hostStatus = BTSTAT_SELTIMEO;
+         trace_pvscsi_process_req_descr_unknown_device();
+@@ -795,12 +898,79 @@ pvscsi_dbg_dump_tx_rings_config(PVSCSICmdDescSetupRings *rc)
+ }
+ 
+ static uint64_t
++
+ pvscsi_on_cmd_config(PVSCSIState *s)
++
+ {
+-    trace_pvscsi_on_cmd_noimpl("PVSCSI_CMD_CONFIG");
+-    return PVSCSI_COMMAND_PROCESSING_FAILED;
++
++    PVSCSICmdDescConfigCmd *cmd =
++
++        (PVSCSICmdDescConfigCmd *) s->curr_cmd_data;
++
++    PVSCSIConfigPageHeader hdr = { 0 };
++
++    uint64_t config_page_address = cmd->configPageAddress;
++
++
++
++    if ((config_page_address & UINT32_MAX) == 0) {
++
++        config_page_address >>= 32;
++
++    }
++
++
++
++    trace_pvscsi_on_cmd_arrived("PVSCSI_CMD_CONFIG");
++
++    if (config_page_address != PVSCSI_CONFIG_CONTROLLER_ADDRESS ||
++
++        cmd->configPageNum != PVSCSI_CONFIG_PAGE_CONTROLLER) {
++
++
++        hdr.pageNum = cmd->configPageNum;
++
++        hdr.numDwords = sizeof(hdr) / sizeof(uint32_t);
++
++        hdr.hostStatus = BTSTAT_INVPARAM;
++
++        hdr.scsiStatus = CHECK_CONDITION;
++
++        cpu_physical_memory_write(cmd->cmpAddr, &hdr, sizeof(hdr));
++
++        return PVSCSI_COMMAND_PROCESSING_SUCCEEDED;
++
++    }
++
++
++
++    PVSCSIConfigPageController page = { 0 };
++
++
++
++    page.header.pageNum = PVSCSI_CONFIG_PAGE_CONTROLLER;
++
++    page.header.numDwords = sizeof(page) / sizeof(uint32_t);
++
++    page.header.hostStatus = BTSTAT_SUCCESS;
++
++    page.header.scsiStatus = GOOD;
++
++    page.numPhys = 1;
++
++    page.useConsecutivePhyWWNs = 1;
++
++
++
++    cpu_physical_memory_write(cmd->cmpAddr, &page, sizeof(page));
++
++    hyc3_pvscsi_log(s, "config controller page numPhys=%u", page.numPhys);
++
++    return PVSCSI_COMMAND_PROCESSING_SUCCEEDED;
++
+ }
+ 
++
+ static uint64_t
+ pvscsi_on_cmd_unplug(PVSCSIState *s)
+ {
+@@ -940,7 +1110,7 @@ static const struct {
+ 
+     /* Not implemented, data size defined based on what arrives on windows */
+     [PVSCSI_CMD_CONFIG] = {
+-        .data_size = 6 * sizeof(uint32_t),
++        .data_size = sizeof(PVSCSICmdDescConfigCmd),
+         .handler_fn = pvscsi_on_cmd_config,
+     },
+ 
+diff --git a/hw/scsi/vmw_pvscsi.h b/hw/scsi/vmw_pvscsi.h
+index 17fcf66273..9d6a6a2fa4 100644
+--- a/hw/scsi/vmw_pvscsi.h
++++ b/hw/scsi/vmw_pvscsi.h
+@@ -44,6 +44,7 @@ enum HostBusAdapterStatus {
+                                  /* requested by target           */
+    BTSTAT_LUNMISMATCH   = 0x17,  /* linked CCB has different LUN  */
+                                  /* from first CCB                */
++   BTSTAT_INVPARAM      = 0x1a,  /* invalid parameter */
+    BTSTAT_SENSFAILED    = 0x1b,  /* auto request sense failed */
+    BTSTAT_TAGREJECT     = 0x1c,  /* SCSI II tagged queueing message */
+                                  /* rejected by target              */
+@@ -119,6 +120,30 @@ struct PVSCSICmdDescResetDevice {
+ 
+ typedef struct PVSCSICmdDescResetDevice PVSCSICmdDescResetDevice;
+ 
++/*
++ * Command descriptor for PVSCSI_CMD_CONFIG --
++ */
++struct PVSCSICmdDescConfigCmd {
++    uint64_t    cmpAddr;
++    uint64_t    configPageAddress;
++    uint32_t    configPageNum;
++    uint32_t    pad;
++} QEMU_PACKED;
++
++typedef struct PVSCSICmdDescConfigCmd PVSCSICmdDescConfigCmd;
++
++enum PVSCSIConfigPageType {
++    PVSCSI_CONFIG_PAGE_CONTROLLER = 0x1958,
++    PVSCSI_CONFIG_PAGE_PHY        = 0x1959,
++    PVSCSI_CONFIG_PAGE_DEVICE     = 0x195a,
++};
++
++enum PVSCSIConfigPageAddressType {
++    PVSCSI_CONFIG_CONTROLLER_ADDRESS = 0x2120,
++    PVSCSI_CONFIG_BUSTARGET_ADDRESS  = 0x2121,
++    PVSCSI_CONFIG_PHY_ADDRESS        = 0x2122,
++};
++
+ /*
+  * Command descriptor for PVSCSI_CMD_ABORT_CMD --
+  *
+@@ -363,6 +388,30 @@ struct PVSCSIRingCmpDesc {
+ 
+ typedef struct PVSCSIRingCmpDesc PVSCSIRingCmpDesc;
+ 
++struct PVSCSIConfigPageHeader {
++    uint32_t    pageNum;
++    uint16_t    numDwords;
++    uint16_t    hostStatus;
++    uint16_t    scsiStatus;
++    uint16_t    reserved[3];
++} QEMU_PACKED;
++
++struct PVSCSIConfigPageController {
++    struct PVSCSIConfigPageHeader header;
++    uint64_t    nodeWWN;
++    uint16_t    manufacturer[64];
++    uint16_t    serialNumber[64];
++    uint16_t    opromVersion[32];
++    uint16_t    hwVersion[32];
++    uint16_t    firmwareVersion[32];
++    uint32_t    numPhys;
++    uint8_t     useConsecutivePhyWWNs;
++    uint8_t     reserved[3];
++} QEMU_PACKED;
++
++typedef struct PVSCSIConfigPageHeader PVSCSIConfigPageHeader;
++typedef struct PVSCSIConfigPageController PVSCSIConfigPageController;
++
+ /*
+  * Interrupt status / IRQ bits.
+  */
+diff --git a/hw/virtio/virtio-pci.c b/hw/virtio/virtio-pci.c
+index 1a7039fb0c..c19b61801a 100644
+--- a/hw/virtio/virtio-pci.c
++++ b/hw/virtio/virtio-pci.c
+@@ -41,6 +41,25 @@
+ #include "sysemu/replay.h"
+ #include "trace.h"
+ 
++extern bool is_tdx_vm(void);
++
++static bool hyc3_qemu_debug_enabled(void)
++{
++    const char *debug = getenv("HYC3_QEMU_DEBUG");
++
++    return debug && debug[0] && strcmp(debug, "0") != 0;
++}
++
++static const char *hyc3_pci_dev_id(PCIDevice *dev)
++{
++    return dev->qdev.id ? dev->qdev.id : "-";
++}
++
++static uint32_t hyc3_pci_requester_id(PCIDevice *dev)
++{
++    return pci_requester_id(dev);
++}
++
+ #define VIRTIO_PCI_REGION_SIZE(dev)     VIRTIO_PCI_CONFIG_OFF(msix_present(dev))
+ 
+ #undef VIRTIO_PCI_CONFIG
+@@ -75,6 +94,17 @@ static void virtio_pci_notify(DeviceState *d, uint16_t vector)
+     if (msix_enabled(&proxy->pci_dev)) {
+         if (vector != VIRTIO_NO_VECTOR) {
+             msix_notify(&proxy->pci_dev, vector);
++        } else if (is_tdx_vm() && proxy->nvectors > 1) {
++            static unsigned int hyc3_tdx_no_vector_fallback_logs;
++
++            if (hyc3_qemu_debug_enabled() && hyc3_tdx_no_vector_fallback_logs++ < 128) {
++                uint32_t rid = hyc3_pci_requester_id(&proxy->pci_dev);
++                fprintf(stderr,
++                        "HYC3-VIRTIO-PCI: fallback NO_VECTOR dev=%s id=%s rid=0x%x slot=%u fn=%u notify to MSI-X vector 1 nvectors=%u\n",
++                        proxy->pci_dev.name, hyc3_pci_dev_id(&proxy->pci_dev), rid,
++                        PCI_SLOT(rid & 0xff), PCI_FUNC(rid & 0xff), proxy->nvectors);
++            }
++            msix_notify(&proxy->pci_dev, 1);
+         }
+     } else {
+         VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
+@@ -82,6 +112,27 @@ static void virtio_pci_notify(DeviceState *d, uint16_t vector)
+     }
+ }
+ 
++static void hyc3_tdx_kick_msix_queue(VirtIOPCIProxy *proxy, VirtIODevice *vdev,
++                                      unsigned int queue, uint16_t vector,
++                                      const char *reason)
++{
++    static unsigned int hyc3_tdx_kick_logs;
++
++    if (!is_tdx_vm() || vector == VIRTIO_NO_VECTOR || vector >= proxy->nvectors) {
++        return;
++    }
++
++    if (hyc3_qemu_debug_enabled() && hyc3_tdx_kick_logs++ < 128) {
++        uint32_t rid = hyc3_pci_requester_id(&proxy->pci_dev);
++        fprintf(stderr,
++                "HYC3-VIRTIO-PCI: kick MSI-X dev=%s id=%s rid=0x%x slot=%u fn=%u queue=%u vector=%u reason=%s status=0x%x msix_enabled=%d\n",
++                proxy->pci_dev.name, hyc3_pci_dev_id(&proxy->pci_dev), rid,
++                PCI_SLOT(rid & 0xff), PCI_FUNC(rid & 0xff), queue, vector,
++                reason, vdev->status, msix_enabled(&proxy->pci_dev));
++    }
++    msix_notify(&proxy->pci_dev, vector);
++}
++
+ static void virtio_pci_save_config(DeviceState *d, QEMUFile *f)
+ {
+     VirtIOPCIProxy *proxy = to_virtio_pci_proxy(d);
+@@ -420,7 +471,16 @@ static void virtio_ioport_write(void *opaque, uint32_t addr, uint32_t val)
+         virtio_set_status(vdev, val & 0xFF);
+ 
+         if (val & VIRTIO_CONFIG_S_DRIVER_OK) {
++            int q;
++
+             virtio_pci_start_ioeventfd(proxy);
++            for (q = 0; q < VIRTIO_QUEUE_MAX; q++) {
++                uint16_t qvec = virtio_queue_vector(vdev, q);
++
++                if (qvec != VIRTIO_NO_VECTOR) {
++                    hyc3_tdx_kick_msix_queue(proxy, vdev, q, qvec, "DRIVER_OK");
++                }
++            }
+         }
+ 
+         if (vdev->status == 0) {
+@@ -461,6 +521,7 @@ static void virtio_ioport_write(void *opaque, uint32_t addr, uint32_t val)
+             val = VIRTIO_NO_VECTOR;
+         }
+         virtio_queue_set_vector(vdev, vdev->queue_sel, val);
++        hyc3_tdx_kick_msix_queue(proxy, vdev, vdev->queue_sel, val, "Q_MSIX");
+         break;
+     default:
+         qemu_log_mask(LOG_GUEST_ERROR,
+@@ -1227,6 +1288,15 @@ static int virtio_pci_set_guest_notifiers(DeviceState *d, int nvqs, bool assign)
+     int r, n;
+     bool with_irqfd = msix_enabled(&proxy->pci_dev) &&
+         kvm_msi_via_irqfd_enabled();
++    static unsigned int hyc3_tdx_irqfd_logs;
++
++    if (with_irqfd && is_tdx_vm()) {
++        if (hyc3_qemu_debug_enabled() && hyc3_tdx_irqfd_logs++ < 8) {
++            fprintf(stderr,
++                    "HYC3-VIRTIO: disabling MSI irqfd for TDX virtio-pci\n");
++        }
++        with_irqfd = false;
++    }
+ 
+     nvqs = MIN(nvqs, VIRTIO_QUEUE_MAX);
+ 
+@@ -1545,6 +1615,27 @@ static void virtio_pci_common_write(void *opaque, hwaddr addr,
+         return;
+     }
+ 
++    if (is_tdx_vm() && hyc3_qemu_debug_enabled()) {
++        static unsigned int hyc3_tdx_common_write_logs;
++
++        if (hyc3_tdx_common_write_logs < 256 &&
++            (addr == VIRTIO_PCI_COMMON_MSIX ||
++             addr == VIRTIO_PCI_COMMON_STATUS ||
++             addr == VIRTIO_PCI_COMMON_Q_SELECT ||
++             addr == VIRTIO_PCI_COMMON_Q_MSIX ||
++             addr == VIRTIO_PCI_COMMON_Q_ENABLE)) {
++            hyc3_tdx_common_write_logs++;
++            uint32_t rid = hyc3_pci_requester_id(&proxy->pci_dev);
++            fprintf(stderr,
++                    "HYC3-VIRTIO-COMMON-W: dev=%s id=%s rid=0x%x slot=%u fn=%u addr=0x%" HWADDR_PRIx " val=0x%" PRIx64 " size=%u qsel=%u nvectors=%u old_qvec=%u cfgvec=%u\n",
++                    proxy->pci_dev.name, hyc3_pci_dev_id(&proxy->pci_dev), rid,
++                    PCI_SLOT(rid & 0xff), PCI_FUNC(rid & 0xff), addr, val, size,
++                    vdev->queue_sel, proxy->nvectors,
++                    virtio_queue_vector(vdev, vdev->queue_sel),
++                    vdev->config_vector);
++        }
++    }
++
+     switch (addr) {
+     case VIRTIO_PCI_COMMON_DFSELECT:
+         proxy->dfselect = val;
+@@ -1580,7 +1671,16 @@ static void virtio_pci_common_write(void *opaque, hwaddr addr,
+         virtio_set_status(vdev, val & 0xFF);
+ 
+         if (val & VIRTIO_CONFIG_S_DRIVER_OK) {
++            int q;
++
+             virtio_pci_start_ioeventfd(proxy);
++            for (q = 0; q < VIRTIO_QUEUE_MAX; q++) {
++                uint16_t qvec = virtio_queue_vector(vdev, q);
++
++                if (qvec != VIRTIO_NO_VECTOR) {
++                    hyc3_tdx_kick_msix_queue(proxy, vdev, q, qvec, "COMMON_DRIVER_OK");
++                }
++            }
+         }
+ 
+         if (vdev->status == 0) {
+@@ -1611,6 +1711,7 @@ static void virtio_pci_common_write(void *opaque, hwaddr addr,
+             val = VIRTIO_NO_VECTOR;
+         }
+         virtio_queue_set_vector(vdev, vdev->queue_sel, val);
++        hyc3_tdx_kick_msix_queue(proxy, vdev, vdev->queue_sel, val, "COMMON_Q_MSIX");
+         break;
+     case VIRTIO_PCI_COMMON_Q_ENABLE:
+         if (val == 1) {
+@@ -1626,6 +1727,9 @@ static void virtio_pci_common_write(void *opaque, hwaddr addr,
+             proxy->vqs[vdev->queue_sel].enabled = 1;
+             proxy->vqs[vdev->queue_sel].reset = 0;
+             virtio_queue_enable(vdev, vdev->queue_sel);
++            hyc3_tdx_kick_msix_queue(proxy, vdev, vdev->queue_sel,
++                                     virtio_queue_vector(vdev, vdev->queue_sel),
++                                     "Q_ENABLE");
+         } else {
+             virtio_error(vdev, "wrong value for queue_enable %"PRIx64, val);
+         }
+@@ -1684,6 +1788,17 @@ static void virtio_pci_notify_write(void *opaque, hwaddr addr,
+     unsigned queue = addr / virtio_pci_queue_mem_mult(proxy);
+ 
+     if (vdev != NULL && queue < VIRTIO_QUEUE_MAX) {
++        static unsigned int hyc3_tdx_notify_write_logs;
++
++        if (is_tdx_vm() && hyc3_qemu_debug_enabled() && hyc3_tdx_notify_write_logs++ < 512) {
++            uint32_t rid = hyc3_pci_requester_id(&proxy->pci_dev);
++            fprintf(stderr,
++                    "HYC3-VIRTIO-PCI: notify dev=%s id=%s rid=0x%x slot=%u fn=%u MMIO addr=0x%" HWADDR_PRIx
++                    " val=0x%" PRIx64 " size=%u queue=%u qvec=%u status=0x%x\n",
++                    proxy->pci_dev.name, hyc3_pci_dev_id(&proxy->pci_dev), rid,
++                    PCI_SLOT(rid & 0xff), PCI_FUNC(rid & 0xff), addr, val, size,
++                    queue, virtio_queue_vector(vdev, queue), vdev->status);
++        }
+         trace_virtio_pci_notify_write(addr, val, size);
+         virtio_queue_notify(vdev, queue);
+     }
+@@ -2033,11 +2148,23 @@ static void virtio_pci_device_plugged(DeviceState *d, Error **errp)
+                                             &notify_pio.cap);
+         }
+ 
+-        pci_register_bar(&proxy->pci_dev, proxy->modern_mem_bar_idx,
+-                         PCI_BASE_ADDRESS_SPACE_MEMORY |
+-                         PCI_BASE_ADDRESS_MEM_PREFETCH |
+-                         PCI_BASE_ADDRESS_MEM_TYPE_64,
+-                         &proxy->modern_bar);
++        if (is_tdx_vm()) {
++            static unsigned int hyc3_tdx_modern_bar_logs;
++
++            if (hyc3_qemu_debug_enabled() && hyc3_tdx_modern_bar_logs++ < 8) {
++                fprintf(stderr,
++                        "HYC3-VIRTIO-PCI: using 32-bit modern BAR for TDX\\n");
++            }
++            pci_register_bar(&proxy->pci_dev, proxy->modern_mem_bar_idx,
++                             PCI_BASE_ADDRESS_SPACE_MEMORY,
++                             &proxy->modern_bar);
++        } else {
++            pci_register_bar(&proxy->pci_dev, proxy->modern_mem_bar_idx,
++                             PCI_BASE_ADDRESS_SPACE_MEMORY |
++                             PCI_BASE_ADDRESS_MEM_PREFETCH |
++                             PCI_BASE_ADDRESS_MEM_TYPE_64,
++                             &proxy->modern_bar);
++        }
+ 
+         proxy->config_cap = virtio_pci_add_mem_cap(proxy, &cfg.cap);
+         cfg_mask = (void *)(proxy->pci_dev.wmask + proxy->config_cap);
+diff --git a/hw/virtio/virtio.c b/hw/virtio/virtio.c
+index d229755eae..177a47d8e2 100644
+--- a/hw/virtio/virtio.c
++++ b/hw/virtio/virtio.c
+@@ -46,6 +46,37 @@
+ #include "standard-headers/linux/virtio_mem.h"
+ #include "standard-headers/linux/virtio_vsock.h"
+ 
++extern bool is_tdx_vm(void);
++
++static bool hyc3_qemu_debug_enabled(void)
++{
++    const char *debug = getenv("HYC3_QEMU_DEBUG");
++
++    return debug && debug[0] && strcmp(debug, "0") != 0;
++}
++
++#define HYC3_TDX_DMA_SHARED_BITS ((1ULL << 47) | (1ULL << 51))
++
++static hwaddr hyc3_virtio_dma_addr(VirtIODevice *vdev, hwaddr addr, const char *what)
++{
++    hwaddr normalized;
++    static unsigned int hyc3_tdx_dma_logs;
++
++    if (!is_tdx_vm()) {
++        return addr;
++    }
++
++    normalized = addr & ~HYC3_TDX_DMA_SHARED_BITS;
++    if (normalized != addr && hyc3_qemu_debug_enabled() && hyc3_tdx_dma_logs++ < 512) {
++        const char *id = vdev->parent_obj.id ? vdev->parent_obj.id : "-";
++        fprintf(stderr,
++                "HYC3-VIRTIO-DMA: vdev=%s id=%s %s addr=0x%" HWADDR_PRIx
++                " -> 0x%" HWADDR_PRIx "\n",
++                vdev->name ? vdev->name : "-", id, what, addr, normalized);
++    }
++    return normalized;
++}
++
+ /*
+  * Maximum size of virtio device config space
+  */
+@@ -235,7 +266,7 @@ void virtio_init_region_cache(VirtIODevice *vdev, int n)
+     bool packed;
+ 
+ 
+-    addr = vq->vring.desc;
++    addr = hyc3_virtio_dma_addr(vdev, vq->vring.desc, "vring.desc");
+     if (!addr) {
+         goto out_no_cache;
+     }
+@@ -252,7 +283,9 @@ void virtio_init_region_cache(VirtIODevice *vdev, int n)
+ 
+     size = virtio_queue_get_used_size(vdev, n);
+     len = address_space_cache_init(&new->used, vdev->dma_as,
+-                                   vq->vring.used, size, true);
++                                   hyc3_virtio_dma_addr(vdev, vq->vring.used,
++                                                        "vring.used"),
++                                   size, true);
+     if (len < size) {
+         virtio_error(vdev, "Cannot map used");
+         goto err_used;
+@@ -260,7 +293,9 @@ void virtio_init_region_cache(VirtIODevice *vdev, int n)
+ 
+     size = virtio_queue_get_avail_size(vdev, n);
+     len = address_space_cache_init(&new->avail, vdev->dma_as,
+-                                   vq->vring.avail, size, false);
++                                   hyc3_virtio_dma_addr(vdev, vq->vring.avail,
++                                                        "vring.avail"),
++                                   size, false);
+     if (len < size) {
+         virtio_error(vdev, "Cannot map avail");
+         goto err_avail;
+@@ -309,6 +344,7 @@ static void vring_split_desc_read(VirtIODevice *vdev, VRingDesc *desc,
+     virtio_tswap32s(vdev, &desc->len);
+     virtio_tswap16s(vdev, &desc->flags);
+     virtio_tswap16s(vdev, &desc->next);
++    desc->addr = hyc3_virtio_dma_addr(vdev, desc->addr, "split.desc");
+ }
+ 
+ static void vring_packed_event_read(VirtIODevice *vdev,
+@@ -614,6 +650,7 @@ static void vring_packed_desc_read(VirtIODevice *vdev,
+     virtio_tswap64s(vdev, &desc->addr);
+     virtio_tswap16s(vdev, &desc->id);
+     virtio_tswap32s(vdev, &desc->len);
++    desc->addr = hyc3_virtio_dma_addr(vdev, desc->addr, "packed.desc");
+ }
+ 
+ static void vring_packed_desc_write_data(VirtIODevice *vdev,
+@@ -1400,6 +1437,7 @@ static bool virtqueue_map_desc(VirtIODevice *vdev, unsigned int *p_num_sg,
+             goto out;
+         }
+ 
++        pa = hyc3_virtio_dma_addr(vdev, pa, is_write ? "buffer.in" : "buffer.out");
+         iov[num_sg].iov_base = dma_memory_map(vdev->dma_as, pa, &len,
+                                               is_write ?
+                                               DMA_DIRECTION_FROM_DEVICE :
+@@ -1450,8 +1488,10 @@ static void virtqueue_map_iovec(VirtIODevice *vdev, struct iovec *sg,
+ 
+     for (i = 0; i < num_sg; i++) {
+         len = sg[i].iov_len;
++        hwaddr pa = hyc3_virtio_dma_addr(vdev, addr[i],
++                                          is_write ? "saved.in" : "saved.out");
+         sg[i].iov_base = dma_memory_map(vdev->dma_as,
+-                                        addr[i], &len, is_write ?
++                                        pa, &len, is_write ?
+                                         DMA_DIRECTION_FROM_DEVICE :
+                                         DMA_DIRECTION_TO_DEVICE,
+                                         MEMTXATTRS_UNSPECIFIED);
+@@ -1993,6 +2033,18 @@ static void virtio_notify_vector(VirtIODevice *vdev, uint16_t vector)
+     BusState *qbus = qdev_get_parent_bus(DEVICE(vdev));
+     VirtioBusClass *k = VIRTIO_BUS_GET_CLASS(qbus);
+ 
++    if (is_tdx_vm() && hyc3_qemu_debug_enabled()) {
++        static unsigned int hyc3_tdx_notify_vector_logs;
++
++        if (hyc3_tdx_notify_vector_logs++ < 512) {
++            const char *id = vdev->parent_obj.id ? vdev->parent_obj.id : "-";
++            fprintf(stderr,
++                    "HYC3-VIRTIO-NOTIFY-VECTOR: vdev=%s id=%s vector=%u disabled=%d has_notify=%d status=0x%x\n",
++                    vdev->name ? vdev->name : "-", id, vector,
++                    virtio_device_disabled(vdev), k->notify != NULL, vdev->status);
++        }
++    }
++
+     if (virtio_device_disabled(vdev)) {
+         return;
+     }
+@@ -2493,9 +2545,25 @@ static void virtio_irq(VirtQueue *vq)
+ 
+ void virtio_notify(VirtIODevice *vdev, VirtQueue *vq)
+ {
++    bool should_notify;
++
+     WITH_RCU_READ_LOCK_GUARD() {
+-        if (!virtio_should_notify(vdev, vq)) {
+-            return;
++        should_notify = virtio_should_notify(vdev, vq);
++    }
++
++    if (!should_notify && !is_tdx_vm()) {
++        return;
++    }
++
++    if (is_tdx_vm() && hyc3_qemu_debug_enabled()) {
++        static unsigned int hyc3_tdx_notify_logs;
++
++        if (hyc3_tdx_notify_logs++ < 512) {
++            const char *id = vdev->parent_obj.id ? vdev->parent_obj.id : "-";
++            fprintf(stderr,
++                    "HYC3-VIRTIO-NOTIFY: vdev=%s id=%s vector=%u should=%d used_idx=%u inuse=%u status=0x%x\n",
++                    vdev->name ? vdev->name : "-", id, vq->vector, should_notify,
++                    vq->used_idx, vq->inuse, vdev->status);
+         }
+     }
+ 
+diff --git a/include/hw/acpi/cpu.h b/include/hw/acpi/cpu.h
+index e6e1a9ef59..257929b2cc 100644
+--- a/include/hw/acpi/cpu.h
++++ b/include/hw/acpi/cpu.h
+@@ -55,6 +55,7 @@ typedef struct CPUHotplugFeatures {
+     bool has_legacy_cphp;
+     bool fw_unplugs_cpu;
+     const char *smi_path;
++    uint32_t cpu_count_limit;
+ } CPUHotplugFeatures;
+ 
+ typedef void (*build_madt_cpu_fn)(int uid, const CPUArchIdList *apic_ids,
+diff --git a/include/hw/boards.h b/include/hw/boards.h
+index 2e6156ae96..c7e927158d 100644
+--- a/include/hw/boards.h
++++ b/include/hw/boards.h
+@@ -402,6 +402,9 @@ struct MachineState {
+     char *kernel_filename;
+     char *kernel_cmdline;
+     char *initrd_filename;
++    char *kernel2_filename;
++    char *kernel2_cmdline;
++    char *initrd2_filename;
+     const char *cpu_type;
+     AccelState *accelerator;
+     CPUArchIdList *possible_cpus;
+diff --git a/include/hw/nvram/fw_cfg.h b/include/hw/nvram/fw_cfg.h
+index c1f81a5f13..9c7e840f95 100644
+--- a/include/hw/nvram/fw_cfg.h
++++ b/include/hw/nvram/fw_cfg.h
+@@ -12,6 +12,9 @@
+ #define TYPE_FW_CFG_MEM "fw_cfg_mem"
+ #define TYPE_FW_CFG_DATA_GENERATOR_INTERFACE "fw_cfg-data-generator"
+ 
++#define FW_CFG_MAX_VCPU_STATES 256
++#define FW_CFG_HYC3_L2_ALIAS_COUNT 4
++
+ OBJECT_DECLARE_SIMPLE_TYPE(FWCfgState, FW_CFG)
+ OBJECT_DECLARE_SIMPLE_TYPE(FWCfgIoState, FW_CFG_IO)
+ OBJECT_DECLARE_SIMPLE_TYPE(FWCfgMemState, FW_CFG_MEM)
+@@ -70,12 +73,24 @@ struct FWCfgState {
+     FWCfgFiles *files;
+     uint16_t cur_entry;
+     uint32_t cur_offset;
++    uint16_t cur_entry_by_cpu[FW_CFG_MAX_VCPU_STATES];
++    uint32_t cur_offset_by_cpu[FW_CFG_MAX_VCPU_STATES];
+     Notifier machine_ready;
+ 
+     int fw_cfg_order_override;
+ 
+     bool dma_enabled;
+     dma_addr_t dma_addr;
++    dma_addr_t dma_addr_by_cpu[FW_CFG_MAX_VCPU_STATES];
++    uint64_t hyc3_l2_dma_gpa_offset;
++    unsigned int hyc3_l2_dma_first_cpu;
++    bool hyc3_l2_fw_cfg_alias;
++    bool hyc3_l2_fw_cfg_primary_done;
++    uint8_t hyc3_l2_fw_cfg_primary_seen;
++    unsigned int hyc3_l2_fw_cfg_first_cpu;
++    uint16_t hyc3_l2_alias_data_key[FW_CFG_HYC3_L2_ALIAS_COUNT];
++    uint32_t hyc3_l2_alias_size_le[FW_CFG_HYC3_L2_ALIAS_COUNT];
++    FWCfgEntry *hyc3_l2_alias_size_entries;
+     AddressSpace *dma_as;
+     MemoryRegion dma_iomem;
+ 
+@@ -327,6 +342,10 @@ FWCfgState *fw_cfg_init_mem_wide(hwaddr ctl_addr,
+ 
+ FWCfgState *fw_cfg_find(void);
+ bool fw_cfg_dma_enabled(void *opaque);
++void fw_cfg_set_hyc3_l2_dma_offset(FWCfgState *s, unsigned int first_vcpu_index,
++                                   uint64_t offset);
++void fw_cfg_set_hyc3_l2_kernel_alias(FWCfgState *s,
++                                      unsigned int first_vcpu_index);
+ 
+ /**
+  * fw_cfg_arch_key_name:
+diff --git a/include/sysemu/kvm.h b/include/sysemu/kvm.h
+index 78fcf1c3a6..ce6429984b 100644
+--- a/include/sysemu/kvm.h
++++ b/include/sysemu/kvm.h
+@@ -369,6 +369,7 @@ int kvm_arch_msi_data_to_gsi(uint32_t data);
+ 
+ int kvm_set_irq(KVMState *s, int irq, int level);
+ int kvm_irqchip_send_msi(KVMState *s, MSIMessage msg);
++int kvm_irqchip_send_msi_with_devid(KVMState *s, MSIMessage msg, uint32_t devid);
+ 
+ void kvm_irqchip_add_irq_route(KVMState *s, int gsi, int irqchip, int pin);
+ 
+diff --git a/qemu-options.hx b/qemu-options.hx
+index 9a47385c15..82e56f33b8 100644
+--- a/qemu-options.hx
++++ b/qemu-options.hx
+@@ -3988,6 +3988,13 @@ SRST
+     or in multiboot format.
+ ERST
+ 
++DEF("kernel2", HAS_ARG, QEMU_OPTION_kernel2, \
++    "-kernel2 bzImage use 'bzImage' as kernel 2 image\n", QEMU_ARCH_ALL)
++SRST
++``-kernel2 bzImage``
++    Use bzImage as kernel 2 image.
++ERST
++
+ DEF("append", HAS_ARG, QEMU_OPTION_append, \
+     "-append cmdline use 'cmdline' as kernel command line\n", QEMU_ARCH_ALL)
+ SRST
+@@ -3995,6 +4002,13 @@ SRST
+     Use cmdline as kernel command line
+ ERST
+ 
++DEF("append2", HAS_ARG, QEMU_OPTION_append2, \
++    "-append2 cmdline use 'cmdline' as kernel 2 command line\n", QEMU_ARCH_ALL)
++SRST
++``-append2 cmdline``
++    Use cmdline as kernel 2 command line
++ERST
++
+ DEF("initrd", HAS_ARG, QEMU_OPTION_initrd, \
+            "-initrd file    use 'file' as initial ram disk\n", QEMU_ARCH_ALL)
+ SRST(initrd)
+@@ -4016,6 +4030,13 @@ SRST(initrd)
+ 
+ ERST
+ 
++DEF("initrd2", HAS_ARG, QEMU_OPTION_initrd2, \
++           "-initrd2 file    use 'file' as initial ram disk 2\n", QEMU_ARCH_ALL)
++SRST(initrd2)
++``-initrd2 file``
++    Use file as initial ram disk 2.
++ERST
++
+ DEF("dtb", HAS_ARG, QEMU_OPTION_dtb, \
+     "-dtb    file    use 'file' as device tree image\n", QEMU_ARCH_ALL)
+ SRST
+diff --git a/system/vl.c b/system/vl.c
+index e480afd7a0..46d00d7a17 100644
+--- a/system/vl.c
++++ b/system/vl.c
+@@ -2906,12 +2906,21 @@ void qemu_init(int argc, char **argv)
+             case QEMU_OPTION_kernel:
+                 qdict_put_str(machine_opts_dict, "kernel", optarg);
+                 break;
++            case QEMU_OPTION_kernel2:
++                qdict_put_str(machine_opts_dict, "kernel2", optarg);
++                break;
+             case QEMU_OPTION_initrd:
+                 qdict_put_str(machine_opts_dict, "initrd", optarg);
+                 break;
++            case QEMU_OPTION_initrd2:
++                qdict_put_str(machine_opts_dict, "initrd2", optarg);
++                break;
+             case QEMU_OPTION_append:
+                 qdict_put_str(machine_opts_dict, "append", optarg);
+                 break;
++            case QEMU_OPTION_append2:
++                qdict_put_str(machine_opts_dict, "append2", optarg);
++                break;
+             case QEMU_OPTION_dtb:
+                 qdict_put_str(machine_opts_dict, "dtb", optarg);
+                 break;
+diff --git a/target/i386/kvm/tdx.c b/target/i386/kvm/tdx.c
+index 8ec2523a0d..455c4587b3 100644
+--- a/target/i386/kvm/tdx.c
++++ b/target/i386/kvm/tdx.c
+@@ -368,6 +368,48 @@ static inline int tdx_vcpu_ioctl(void *vcpu_fd, int cmd_id, __u32 flags,
+     return  tdx_ioctl_internal(vcpu_fd, TDX_VCPU_IOCTL, cmd_id, flags, data);
+ }
+ 
++#define HYC3_TDX_EAGAIN_RETRY_LIMIT 60000
++#define HYC3_TDX_EAGAIN_LOG_INTERVAL 5000
++
++static int hyc3_tdx_memory_mapping_retry(struct kvm_memory_mapping *mapping,
++                                         const char *what)
++{
++    unsigned int retries = 0;
++    int r;
++
++    for (;;) {
++        r = kvm_vcpu_ioctl(first_cpu, KVM_MEMORY_MAPPING, mapping);
++        if (r != -EAGAIN) {
++            if (retries) {
++                warn_report("HYC3: KVM_MEMORY_MAPPING %s recovered after %u retries",
++                            what, retries);
++            }
++            return r;
++        }
++
++        if ((retries % HYC3_TDX_EAGAIN_LOG_INTERVAL) == 0) {
++            warn_report("HYC3: KVM_MEMORY_MAPPING %s got EAGAIN base_gfn=0x%" PRIx64
++                        " nr_pages=0x%" PRIx64 " source=0x%" PRIx64
++                        " retry=%u",
++                        what, (uint64_t)mapping->base_gfn,
++                        (uint64_t)mapping->nr_pages,
++                        (uint64_t)mapping->source, retries);
++        }
++
++        if (++retries >= HYC3_TDX_EAGAIN_RETRY_LIMIT) {
++            error_report("HYC3: KVM_MEMORY_MAPPING %s stuck on EAGAIN base_gfn=0x%" PRIx64
++                         " nr_pages=0x%" PRIx64 " source=0x%" PRIx64
++                         " after %u retries",
++                         what, (uint64_t)mapping->base_gfn,
++                         (uint64_t)mapping->nr_pages,
++                         (uint64_t)mapping->source, retries);
++            return r;
++        }
++
++        g_usleep(1000);
++    }
++}
++
+ static int get_tdx_capabilities(Error **errp)
+ {
+     struct kvm_tdx_capabilities *caps;
+@@ -684,6 +726,13 @@ void tdx_init_fw_cfg(MachineState *ms)
+         return;
+     }
+ 
++    /*
++     * HYC3 keeps L2-1/L2-2 separation in SVSM's per-VM L2 SEPT aliases.
++     * Do not offset fw_cfg DMA GPAs here: OVMF may legitimately allocate
++     * boot blob buffers near the top of the low-memory window, and adding
++     * 4G can move those transfers past the actual TD RAM map.
++     */
++
+     data.base = cpu_to_le64(tdx->svsm_base);
+     data.size = cpu_to_le64(tdx->svsm_size);
+ 
+@@ -695,6 +744,15 @@ void tdx_init_fw_cfg(MachineState *ms)
+         fw_cfg_add_file(x86ms->fw_cfg, "etc/tdx/l2bios",
+                 g_memdup(&data, sizeof(data)), sizeof(data));
+     }
++
++    if (tdx->num_l2_vms == 2) {
++        /*
++         * HYC3 L2-2 boot blobs are selected in OVMF via CPUID 0x40000100 and
++         * explicit opt/setup2, opt/kernel2, opt/initrd2, opt/cmdline2 fw_cfg
++         * files.  Keep QEMU's standard kernel/setup/initrd/cmdline keys stable
++         * for L2-1; aliasing them globally can corrupt late EFI stub reads.
++         */
++    }
+ }
+ 
+ static void tdx_finalize_vm(Notifier *notifier, void *unused)
+@@ -745,9 +803,7 @@ static void tdx_finalize_vm(Notifier *notifier, void *unused)
+             .source = (__u64)entry->mem_ptr,
+         };
+ 
+-        do {
+-            r = kvm_vcpu_ioctl(first_cpu, KVM_MEMORY_MAPPING, &mapping);
+-        } while (r == -EAGAIN);
++        r = hyc3_tdx_memory_mapping_retry(&mapping, "tdvf-section");
+ 
+         if (r < 0) {
+              error_report("KVM_MEMORY_MAPPING failed %s", strerror(-r));
+@@ -790,9 +846,7 @@ static void tdx_finalize_vm(Notifier *notifier, void *unused)
+             .nr_pages = tdx_guest->bios2_region->size >> 12,
+         };
+ 
+-        do {
+-            r = kvm_vcpu_ioctl(first_cpu, KVM_MEMORY_MAPPING, &mem_region);
+-        } while (r == -EAGAIN);
++        r = hyc3_tdx_memory_mapping_retry(&mem_region, "l2bios");
+ 
+         if (r < 0) {
+              error_report("KVM_MEMORY_MAPPING failed %s", strerror(-r));

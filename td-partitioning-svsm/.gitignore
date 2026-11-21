@@ -1,0 +1,19 @@
+*.o
+*.bin
+*.elf
+*.swp
+*~
+bin/
+target/
+gen_meta
+stage1/stage1
+stage1/stage1-test
+print-meta
+cbit
+.idea/
+
+# local fuzzing artifacts
+**/fuzz/target
+**/fuzz/corpus
+**/fuzz/artifacts
+**/fuzz/coverage

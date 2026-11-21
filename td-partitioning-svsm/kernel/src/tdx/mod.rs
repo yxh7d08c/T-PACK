@@ -1,0 +1,39 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//
+// Copyright (c) 2023 Intel Corporation.
+//
+// Author: Jason CJ Chen <jason.cj.chen@intel.com>
+
+pub mod error;
+
+mod gctx;
+pub mod gmem;
+mod instr_emul;
+mod interrupts;
+mod ioreq;
+mod msr_bitmap;
+mod opcode;
+mod percpu;
+mod sirte;
+pub mod tdcall;
+mod tdp;
+mod utils;
+mod vcpu;
+mod vcpu_comm;
+mod vcpuid;
+mod vcr;
+mod vioapic;
+mod virq;
+mod vlapic;
+mod vmcs;
+mod vmcs_lib;
+pub mod vmexit;
+mod vmsr;
+
+pub use ioreq::hyc3_init_l2_acpi_filter;
+pub use percpu::{enable_tdp_guests, run_tdpvp, TdPerCpu};
+pub use tdcall::{
+    td_accept_memory, td_shared_mask, tdcall_get_ve_info, tdvmcall_cpuid, tdvmcall_halt,
+    tdvmcall_io_read_16, tdvmcall_io_read_8, tdvmcall_io_write_16, tdvmcall_io_write_8,
+    tdvmcall_rdmsr, tdvmcall_wrmsr, TdVmcallError,
+};

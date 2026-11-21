@@ -1,0 +1,10 @@
+{
+  "shell_syntax": "passed",
+  "loader_c_syntax": "passed",
+  "file_hashes": "passed",
+  "initrd_payload_consistency": "passed",
+  "empty_image_preflight_exit": 2,
+  "guest_boot_test": "not run",
+  "svsm_build": "not run",
+  "private_guest_key_files_found": 0
+}
